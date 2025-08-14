@@ -308,18 +308,21 @@ class JamWorker(threading.Thread):
             self._next_emit_start += (bar_samps - phase)
     
     def _prepare_stream_for_reseed_handoff(self):
-        sr = int(self.mrt.sample_rate)
-        xfade_s = float(self.mrt.config.crossfade_length)
-        xfade_n = int(round(xfade_s * sr))
+        # OLD: keep crossfade tail -> causes phase offset
+        # sr = int(self.mrt.sample_rate)
+        # xfade_s = float(self.mrt.config.crossfade_length)
+        # xfade_n = int(round(xfade_s * sr))
+        # if getattr(self, "_stream", None) is not None and self._stream.shape[0] > 0:
+        #     tail = self._stream[-xfade_n:] if self._stream.shape[0] > xfade_n else self._stream
+        #     self._stream = tail.copy()
+        # else:
+        #     self._stream = None
 
-        if getattr(self, "_stream", None) is not None and self._stream.shape[0] > 0:
-            tail = self._stream[-xfade_n:] if self._stream.shape[0] > xfade_n else self._stream
-            self._stream = tail.copy()
-        else:
-            self._stream = None
+        # NEW: throw away the tail completely; start fresh
+        self._stream = None
 
         self._next_emit_start = 0
-        self._needs_bar_realign = True   # NEW FLAG
+        self._needs_bar_realign = True
 
     def reseed_splice(self, recent_wav, anchor_bars: float):
         """
