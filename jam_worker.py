@@ -233,18 +233,20 @@ class JamWorker(threading.Thread):
 
     def _make_recent_tokens_from_wave(self, wav) -> np.ndarray:
         """
-        Encode a waveform and produce a bar-aligned context token window (same shape/depth
-        as state.context_tokens). Uses your existing codec depth.
+        Encode waveform and produce a BAR-ALIGNED context token window.
         """
-        tokens_full = self.mrt.codec.encode(wav).astype(np.int32)                  # [T, rvq_total]
-        tokens      = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]     # [T, depth]
-        # If you already have a utility that builds bar-aligned context windows, prefer it.
-        # Otherwise clamp to ctx_frames from the tail (bar-aligned trimming happens in splicer).
-        t = tokens.shape[0]
-        ctx = self._ctx_frames()
-        if t > ctx:
-            tokens = tokens[-ctx:]
-        return tokens
+        tokens_full = self.mrt.codec.encode(wav).astype(np.int32)           # [T, rvq_total]
+        tokens      = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]
+
+        from utils import make_bar_aligned_context
+        ctx = make_bar_aligned_context(
+            tokens,
+            bpm=self.params.bpm,
+            fps=int(self.mrt.codec.frame_rate),
+            ctx_frames=self.mrt.config.context_length_frames,
+            beats_per_bar=self.params.beats_per_bar
+        )
+        return ctx
 
     def _bar_aligned_tail(self, tokens: np.ndarray, bars: float) -> np.ndarray:
         """
@@ -260,42 +262,38 @@ class JamWorker(threading.Thread):
         return tokens[-want:]
 
     def _splice_context(self, original_tokens: np.ndarray, recent_tokens: np.ndarray,
-                        anchor_bars: float) -> np.ndarray:
-        """
-        Build new context by concatenating:
-        anchor = tail from originals (anchor_bars)
-        recent = tail from recent_tokens filling the remainder
-        Then clamp to ctx_frames from the tail (safety).
-        """
+                    anchor_bars: float) -> np.ndarray:
+        import math
         ctx_frames = self._ctx_frames()
         depth = original_tokens.shape[1]
+        frames_per_bar = self._frames_per_bar()
 
-        # 1) Take bar-aligned tail from original
-        anchor = self._bar_aligned_tail(original_tokens, anchor_bars)              # [A, depth]
+        # 1) Anchor tail
+        # Use floor, not round, to avoid grabbing an extra bar.
+        anchor = self._bar_aligned_tail(original_tokens, math.floor(anchor_bars))
 
-        # 2) Compute how many frames remain for recent
+        # 2) Fill remainder with recent (in whole bars when possible)
         a = anchor.shape[0]
         remain = max(ctx_frames - a, 0)
-
-        # 3) Take bar-aligned recent tail not exceeding 'remain' (rounded to bars)
         if remain > 0:
-            # how many bars fit in remain?
-            frames_per_bar = self._frames_per_bar()
-            recent_bars_fit = int(remain // frames_per_bar)
-            # if we can’t fit even one bar, just take the exact frame remainder
-            if recent_bars_fit >= 1:
-                want_recent_frames = recent_bars_fit * frames_per_bar
+            bars_fit = remain // frames_per_bar
+            if bars_fit >= 1:
+                want_recent_frames = int(bars_fit * frames_per_bar)
                 recent = recent_tokens[-want_recent_frames:] if recent_tokens.shape[0] > want_recent_frames else recent_tokens
             else:
                 recent = recent_tokens[-remain:] if recent_tokens.shape[0] > remain else recent_tokens
         else:
             recent = recent_tokens[:0]
 
-        # 4) Concat and clamp again (exact)
-        out = np.concatenate([anchor, recent], axis=0) if anchor.size or recent.size else recent_tokens[-ctx_frames:]
+        out = np.concatenate([anchor, recent], axis=0) if (anchor.size or recent.size) else recent_tokens[-ctx_frames:]
         if out.shape[0] > ctx_frames:
             out = out[-ctx_frames:]
-        # safety on depth
+
+        # --- NEW: force total length to a whole number of bars
+        max_bar_aligned = (out.shape[0] // frames_per_bar) * frames_per_bar
+        if max_bar_aligned > 0 and out.shape[0] != max_bar_aligned:
+            out = out[-max_bar_aligned:]
+
         if out.shape[1] != depth:
             out = out[:, :depth]
         return out
