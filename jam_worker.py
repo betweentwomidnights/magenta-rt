@@ -3,6 +3,7 @@ import threading, time, base64, io, uuid
 from dataclasses import dataclass, field
 import numpy as np
 import soundfile as sf
+from magenta_rt import audio as au
 
 from utils import (
     match_loudness_to_reference, stitch_generated, hard_trim_seconds,
@@ -155,77 +156,112 @@ class JamWorker(threading.Thread):
         }
         return b64, meta
 
+    def _append_model_chunk_to_stream(self, wav):
+        """Incrementally append a model chunk with equal-power crossfade."""
+        xfade_s = float(self.mrt.config.crossfade_length)
+        sr = int(self.mrt.sample_rate)
+        xfade_n = int(round(xfade_s * sr))
+
+        s = wav.samples if wav.samples.ndim == 2 else wav.samples[:, None]
+
+        if getattr(self, "_stream", None) is None:
+            # First chunk: drop model pre-roll (xfade head)
+            if s.shape[0] > xfade_n:
+                self._stream = s[xfade_n:].astype(np.float32, copy=True)
+            else:
+                self._stream = np.zeros((0, s.shape[1]), dtype=np.float32)
+            self._next_emit_start = 0  # pointer into _stream (model SR samples)
+            return
+
+        # Crossfade last xfade_n samples of _stream with head of new s
+        if s.shape[0] <= xfade_n or self._stream.shape[0] < xfade_n:
+            # Degenerate safeguard
+            self._stream = np.concatenate([self._stream, s], axis=0)
+            return
+
+        tail = self._stream[-xfade_n:]
+        head = s[:xfade_n]
+
+        # Equal-power envelopes
+        t = np.linspace(0, np.pi/2, xfade_n, endpoint=False, dtype=np.float32)[:, None]
+        eq_in, eq_out = np.sin(t), np.cos(t)
+        mixed = tail * eq_out + head * eq_in
+
+        self._stream = np.concatenate([self._stream[:-xfade_n], mixed, s[xfade_n:]], axis=0)
+
     def run(self):
-        """Main worker loop - generate chunks continuously but don't get too far ahead"""
+        """Continuous stream + sliding 8-bar window emitter."""
+        sr_model = int(self.mrt.sample_rate)
         spb = self._seconds_per_bar()
-        chunk_secs = self.params.bars_per_chunk * spb
+        chunk_secs = float(self.params.bars_per_chunk) * spb
+        chunk_n_model = int(round(chunk_secs * sr_model))
         xfade = self.mrt.config.crossfade_length
 
-        print("🚀 JamWorker started with flow control...")
-        
-        while not self._stop_event.is_set():
-            # Check if we should generate the next chunk
-            if not self._should_generate_next_chunk():
-                # We're ahead enough, wait a bit for frontend to catch up
-                print(f"⏸️  Buffer full, waiting for consumption...")
-                time.sleep(0.5)
-                continue
+        # Streaming state
+        self._stream = None               # np.ndarray [S, C] at model SR
+        self._next_emit_start = 0         # sample pointer for next 8-bar cut
 
-            # Generate the next chunk
+        print("🚀 JamWorker (streaming) started...")
+
+        while not self._stop_event.is_set():
+            # Flow control: don't get too far ahead of the consumer
             with self._lock:
+                if self.idx > self._last_delivered_index + self._max_buffer_ahead:
+                    time.sleep(0.25)
+                    continue
                 style_vec = self.params.style_vec
                 self.mrt.guidance_weight = self.params.guidance_weight
-                self.mrt.temperature = self.params.temperature
-                self.mrt.topk = self.params.topk
-                next_idx = self.idx + 1
+                self.mrt.temperature     = self.params.temperature
+                self.mrt.topk            = self.params.topk
 
-            print(f"🎹 Generating chunk {next_idx}...")
-            
-            # Generate enough model chunks to cover chunk_secs
-            need = chunk_secs
-            chunks = []
+            # Generate ONE model chunk and append to the continuous stream
             self.last_chunk_started_at = time.time()
-            
-            while need > 0 and not self._stop_event.is_set():
-                wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
-                chunks.append(wav)
-                need -= (wav.samples.shape[0] / float(self.mrt.sample_rate))
-
-            if self._stop_event.is_set():
-                break
-
-            # Stitch and trim to exact seconds at model SR
-            y = stitch_generated(chunks, self.mrt.sample_rate, xfade).as_stereo()
-            y = hard_trim_seconds(y, chunk_secs)
-
-            # Post-process
-            if next_idx == 1 and self.params.ref_loop is not None:
-                y, _ = match_loudness_to_reference(
-                    self.params.ref_loop, y,
-                    method=self.params.loudness_mode,
-                    headroom_db=self.params.headroom_db
-                )
-            else:
-                apply_micro_fades(y, 3)
-
-            # Resample + snap + b64
-            b64, meta = self._snap_and_encode(
-                y, seconds=chunk_secs,
-                target_sr=self.params.target_sr,
-                bars=self.params.bars_per_chunk
-            )
-
-            # Store the completed chunk
-            with self._lock:
-                self.idx = next_idx
-                self.outbox.append(JamChunk(index=next_idx, audio_base64=b64, metadata=meta))
-                
-                # Keep outbox bounded (remove old chunks)
-                if len(self.outbox) > 10:
-                    # Remove chunks that are way behind the delivery point
-                    self.outbox = [ch for ch in self.outbox if ch.index > self._last_delivered_index - 5]
-
+            wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
+            self._append_model_chunk_to_stream(wav)
             self.last_chunk_completed_at = time.time()
-            print(f"✅ Completed chunk {next_idx}")
 
-        print("🛑 JamWorker stopped")
+            # While we have at least one full 8-bar window available, emit it
+            while (getattr(self, "_stream", None) is not None and
+                self._stream.shape[0] - self._next_emit_start >= chunk_n_model and
+                not self._stop_event.is_set()):
+
+                seg = self._stream[self._next_emit_start:self._next_emit_start + chunk_n_model]
+
+                # Wrap as Waveform at model SR
+                y = au.Waveform(seg.astype(np.float32, copy=False), sr_model).as_stereo()
+
+                # Post-processing:
+                # - First emitted chunk: loudness-match to ref_loop
+                # - No micro-fades on mid-stream windows (they cause dips)
+                next_idx = self.idx + 1
+                if next_idx == 1 and self.params.ref_loop is not None:
+                    y, _ = match_loudness_to_reference(
+                        self.params.ref_loop, y,
+                        method=self.params.loudness_mode,
+                        headroom_db=self.params.headroom_db
+                    )
+
+                # Resample + snap + encode exactly chunk_secs long
+                b64, meta = self._snap_and_encode(
+                    y, seconds=chunk_secs,
+                    target_sr=self.params.target_sr,
+                    bars=self.params.bars_per_chunk
+                )
+
+                with self._lock:
+                    self.idx = next_idx
+                    self.outbox.append(JamChunk(index=next_idx, audio_base64=b64, metadata=meta))
+                    # Bound the outbox
+                    if len(self.outbox) > 10:
+                        self.outbox = [ch for ch in self.outbox if ch.index > self._last_delivered_index - 5]
+
+                # Advance window pointer to the next 8-bar slot
+                self._next_emit_start += chunk_n_model
+
+                # Trim old samples to keep memory bounded (keep a little guard)
+                keep_from = max(0, self._next_emit_start - chunk_n_model)  # keep 1 extra window
+                if keep_from > 0:
+                    self._stream = self._stream[keep_from:]
+                    self._next_emit_start -= keep_from
+
+        print("🛑 JamWorker (streaming) stopped")
