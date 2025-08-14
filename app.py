@@ -17,6 +17,206 @@ from utils import (
 from jam_worker import JamWorker, JamParams, JamChunk
 import uuid, threading
 
+import gradio as gr
+
+def create_documentation_interface():
+    """Create a Gradio interface for documentation and transparency"""
+    
+    with gr.Blocks(title="MagentaRT Research API", theme=gr.themes.Soft()) as interface:
+        
+        gr.Markdown("""
+        # 🎵 MagentaRT Live Music Generation Research API
+        
+        **Research-only implementation for iOS app development**
+        
+        This API uses Google's [MagentaRT](https://github.com/magenta/magenta-realtime) to generate 
+        continuous music based on input audio loops for experimental iOS app development.
+        """)
+        
+        with gr.Tabs():
+            with gr.Tab("📖 About This Research"):
+                gr.Markdown("""
+                ## What This API Does
+                
+                We're exploring AI-assisted loop-based music creation for mobile apps. Websockets are notoriously annoying in ios-swift apps, so I tried to come up with an http version tailored to the loop based nature of an existing swift app. This API provides:
+                
+                ### 🎹 Single Generation (`/generate`)
+                - Upload audio loop + BPM + style parameters
+                - Returns 4-8 bars of AI-generated continuation
+                - **Performance**: 4 bars in ~9s, 8 bars in ~16s (L40S GPU)
+                
+                ### 🔄 Continuous Jamming (`/jam/*`)
+                - `/jam/start` - Begin continuous generation session
+                - `/jam/next` - Get next bar-aligned chunk
+                - `/jam/stop` - End session
+                - **Performance**: Real-time 8-bar chunks after warmup
+                
+                ## Technical Specs
+                - **Model**: MagentaRT (800M parameter transformer)
+                - **Quality**: 48kHz stereo output
+                - **Context**: 10-second audio analysis window
+                - **Styles**: Text descriptions (e.g., "acid house, techno")
+                
+                ## Research Goals
+                - Seamless AI music generation for loop-based composition
+                - Real-time parameter adjustment during generation
+                - Mobile-optimized music creation workflows
+                """)
+            
+            with gr.Tab("🔧 API Documentation"):
+                gr.Markdown("""
+                ## Single Generation Example
+                ```bash
+                curl -X POST "/generate" \\
+                     -F "loop_audio=@drum_loop.wav" \\
+                     -F "bpm=120" \\
+                     -F "bars=8" \\
+                     -F "styles=acid house,techno" \\
+                     -F "guidance_weight=5.0" \\
+                     -F "temperature=1.1"
+                ```
+                
+                ## Continuous Jamming Example
+                ```bash
+                # 1. Start session
+                SESSION=$(curl -X POST "/jam/start" \\
+                    -F "loop_audio=@loop.wav" \\
+                    -F "bpm=120" \\
+                    -F "bars_per_chunk=8" | jq -r .session_id)
+                
+                # 2. Get chunks in real-time
+                curl "/jam/next?session_id=$SESSION"
+                
+                # 3. Stop when done
+                curl -X POST "/jam/stop" \\
+                     -H "Content-Type: application/json" \\
+                     -d "{\\"session_id\\": \\"$SESSION\\"}"
+                ```
+                
+                ## Key Parameters
+                - **bpm**: 60-200 (beats per minute)
+                - **bars**: 1-16 (bars to generate)
+                - **styles**: Text descriptions, comma-separated
+                - **guidance_weight**: 0.1-10.0 (style adherence)
+                - **temperature**: 0.1-2.0 (randomness)
+                - **intro_bars_to_drop**: Skip N bars from start
+                
+                ## Response Format
+                ```json
+                {
+                  "audio_base64": "...",
+                  "metadata": {
+                    "bpm": 120,
+                    "bars": 8,
+                    "sample_rate": 48000,
+                    "loop_duration_seconds": 16.0
+                  }
+                }
+                ```
+                """)
+            
+            with gr.Tab("📱 iOS App Integration"):
+                gr.Markdown("""
+                ## How Our iOS App Uses This API
+                
+                ### User Flow
+                1. **Record/Import**: User provides drum or instrument loop
+                2. **Parameter Setup**: Set BPM, style, generation settings
+                3. **Continuous Generation**: App calls `/jam/start`
+                4. **Real-time Playback**: App fetches chunks via `/jam/next`
+                5. **Seamless Mixing**: Generated audio mixed into live stream
+                
+                ### Technical Implementation
+                - **Audio Format**: 48kHz WAV for consistency
+                - **Chunk Size**: 8 bars (~16 seconds at 120 BPM)
+                - **Buffer Management**: 3-5 chunks ahead for smooth playback
+                - **Style Updates**: Real-time parameter adjustment via `/jam/update`
+                
+                ### Networking Considerations
+                - **Latency**: ~2-3 seconds per chunk after warmup
+                - **Bandwidth**: ~500KB per 8-bar chunk (compressed)
+                - **Reliability**: Automatic retry with exponential backoff
+                - **Caching**: Local buffer for offline resilience
+                """)
+            
+            with gr.Tab("⚖️ Licensing & Legal"):
+                gr.Markdown("""
+                ## MagentaRT Licensing
+                
+                This project uses Google's MagentaRT model under:
+                - **Source Code**: Apache License 2.0
+                - **Model Weights**: Creative Commons Attribution 4.0 International
+                - **Usage Terms**: [See MagentaRT repository](https://github.com/magenta/magenta-realtime)
+                
+                ### Key Requirements
+                - ✅ **Attribution**: Credit MagentaRT in derivative works
+                - ✅ **Responsible Use**: Don't infringe copyrights
+                - ✅ **No Warranties**: Use at your own risk
+                - ✅ **Patent License**: Explicit patent grants included
+                
+                ## Our Implementation
+                - **Purpose**: Research and development only
+                - **Non-Commercial**: Experimental iOS app development
+                - **Open Source**: Will release implementation under Apache 2.0
+                - **Attribution**: Proper credit to Google Research team
+                
+                ### Required Attribution
+                ```
+                Generated using MagentaRT
+                Copyright 2024 Google LLC
+                Licensed under Apache 2.0 and CC-BY 4.0
+                Implementation for research purposes
+                ```
+                """)
+            
+            with gr.Tab("📊 Performance & Limits"):
+                gr.Markdown("""
+                ## Current Performance (L40S 48GB)
+                
+                ### ⚡ Single Generation
+                - **4 bars @ 100 BPM**: ~9 seconds
+                - **8 bars @ 100 BPM**: ~16 seconds
+                - **Memory usage**: ~40GB VRAM during generation
+                
+                ### 🔄 Continuous Jamming
+                - **Warmup**: ~10-15 seconds first chunk
+                - **8-bar chunks @ 120 BPM**: Real-time delivery
+                - **Buffer ahead**: 3-5 chunks for smooth playback
+                
+                ## Known Limitations
+                
+                ### 🎵 Model Limitations (MagentaRT)
+                - **Context**: 10-second maximum memory
+                - **Training**: Primarily Western instrumental music
+                - **Vocals**: Non-lexical only, no lyric conditioning
+                - **Structure**: No long-form song arrangement
+                - **Inside Swift**: After a few turns of continuous chunks, the swift app works best if you restart the jam from the combined audio again. In this way you might end up with a real jam.
+                
+                ### 🖥️ Infrastructure Limitations
+                - **Concurrency**: Single user jam sessions only
+                - **GPU Memory**: 40GB+ VRAM required for stable operation
+                - **Latency**: 2+ second minimum for style changes
+                - **Uptime**: Research setup, no SLA guarantees
+                
+                ## Resource Requirements
+                - **Minimum**: 24GB VRAM (basic operation, won't operate realtime enough for new chunks coming in)
+                - **Recommended**: 48GB VRAM (stable performance) 
+                - **CPU**: 8+ cores
+                - **System RAM**: 32GB+
+                - **Storage**: 50GB+ for model weights
+                """)
+                
+        gr.Markdown("""
+        ---
+        
+        **🔬 Research Project** | **📱 iOS Development** | **🎵 Powered by MagentaRT**
+        
+        This API is part of ongoing research into AI-assisted music creation for mobile devices.
+        For technical details, see the API documentation tabs above.
+        """)
+    
+    return interface
+
 jam_registry: dict[str, JamWorker] = {}
 jam_lock = threading.Lock()
 
@@ -434,3 +634,30 @@ def jam_status(session_id: str):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/", response_class=Response)
+def read_root():
+    """Root endpoint that explains what this API does"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>MagentaRT Research API</title></head>
+    <body style="font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px;">
+        <h1>🎵 MagentaRT Research API</h1>
+        <p><strong>Purpose:</strong> AI music generation for iOS app research using Google's MagentaRT</p>
+        <h2>Available Endpoints:</h2>
+        <ul>
+            <li><code>POST /generate</code> - Generate 4-8 bars of music</li>
+            <li><code>POST /jam/start</code> - Start continuous jamming</li>
+            <li><code>GET /jam/next</code> - Get next chunk</li>
+            <li><code>GET /jam/consume</code> - confirm a chunk as consumed</li>
+            <li><code>POST /jam/stop</code> - End session</li>
+            <li><code>GET /docs</code> - API documentation</li>
+        </ul>
+        <p><strong>Research Only:</strong> Experimental implementation for iOS app development.</p>
+        <p><strong>Licensing:</strong> Uses MagentaRT (Apache 2.0 + CC-BY 4.0). Users responsible for outputs.</p>
+        <p>Visit <a href="/docs">/docs</a> for detailed API documentation.</p>
+    </body>
+    </html>
+    """
+    return Response(content=html_content, media_type="text/html")
