@@ -38,22 +38,26 @@ class JamWorker(threading.Thread):
         self.mrt = mrt
         self.params = params
         self.state = mrt.init_state()
-        
+
+        # ✅ init synchronization + placeholders FIRST
+        self._lock = threading.Lock()
+        self._original_context_tokens = None   # so hasattr checks are cheap/clear
+
         if params.combined_loop is not None:
             self._setup_context_from_combined_loop()
-            
+
         self.idx = 0
         self.outbox: list[JamChunk] = []
         self._stop_event = threading.Event()
-        
+
         # NEW: Track delivery state
         self._last_delivered_index = 0
-        self._max_buffer_ahead = 5  # Don't generate more than 3 chunks ahead
-        
+        self._max_buffer_ahead = 5
+
         # Timing info
         self.last_chunk_started_at = None
         self.last_chunk_completed_at = None
-        self._lock = threading.Lock()
+
 
     def _setup_context_from_combined_loop(self):
         """Set up MRT context tokens from the combined loop audio"""
