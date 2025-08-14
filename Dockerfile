@@ -120,6 +120,8 @@ RUN python -m pip install huggingface_hub
 
 RUN python -m pip install --no-cache-dir --force-reinstall "protobuf==4.25.3"
 
+RUN python -m pip install gradio
+
 # Switch to Spaces’ preferred user
 # Switch to Spaces’ preferred user
 RUN useradd -m -u 1000 appuser
