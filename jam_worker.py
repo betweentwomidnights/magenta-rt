@@ -298,24 +298,28 @@ class JamWorker(threading.Thread):
             out = out[:, :depth]
         return out
     
+    def _realign_emit_pointer_to_bar(self, sr_model: int):
+        """Advance _next_emit_start to the next bar boundary in model-sample space."""
+        bar_samps = int(round(self._seconds_per_bar() * sr_model))
+        if bar_samps <= 0:
+            return
+        phase = self._next_emit_start % bar_samps
+        if phase != 0:
+            self._next_emit_start += (bar_samps - phase)
+    
     def _prepare_stream_for_reseed_handoff(self):
-        """
-        Keep only a tiny tail to crossfade against the FIRST post-reseed chunk.
-        Reset the emit pointer so the next emitted window starts fresh.
-        """
         sr = int(self.mrt.sample_rate)
         xfade_s = float(self.mrt.config.crossfade_length)
         xfade_n = int(round(xfade_s * sr))
 
-        # If we have a stream, keep just a tail to crossfade with
         if getattr(self, "_stream", None) is not None and self._stream.shape[0] > 0:
             tail = self._stream[-xfade_n:] if self._stream.shape[0] > xfade_n else self._stream
             self._stream = tail.copy()
         else:
             self._stream = None
 
-        # Start a new emission sequence aligned to the new context
         self._next_emit_start = 0
+        self._needs_bar_realign = True   # NEW FLAG
 
     def reseed_splice(self, recent_wav, anchor_bars: float):
         """
@@ -371,6 +375,16 @@ class JamWorker(threading.Thread):
             self.last_chunk_started_at = time.time()
             wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
             self._append_model_chunk_to_stream(wav)
+            if getattr(self, "_needs_bar_realign", False):
+                self._realign_emit_pointer_to_bar(sr_model)
+                self._needs_bar_realign = False
+                # DEBUG
+                bar_samps = int(round(self._seconds_per_bar() * sr_model))
+                if bar_samps > 0 and (self._next_emit_start % bar_samps) != 0:
+                    print(f"⚠️ emit pointer not aligned: phase={self._next_emit_start % bar_samps}")
+                else:
+                    print("✅ emit pointer aligned to bar")
+
             self.last_chunk_completed_at = time.time()
 
             # While we have at least one full 8-bar window available, emit it
