@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import soundfile as sf
 from magenta_rt import audio as au
-
+from threading import RLock
 from utils import (
     match_loudness_to_reference, stitch_generated, hard_trim_seconds,
     apply_micro_fades, make_bar_aligned_context, take_bar_aligned_tail,
@@ -59,31 +59,38 @@ class JamWorker(threading.Thread):
         """Set up MRT context tokens from the combined loop audio"""
         try:
             from utils import make_bar_aligned_context, take_bar_aligned_tail
-            
+
             codec_fps = float(self.mrt.codec.frame_rate)
             ctx_seconds = float(self.mrt.config.context_length_frames) / codec_fps
-            
+
             loop_for_context = take_bar_aligned_tail(
-                self.params.combined_loop, 
-                self.params.bpm, 
-                self.params.beats_per_bar, 
+                self.params.combined_loop,
+                self.params.bpm,
+                self.params.beats_per_bar,
                 ctx_seconds
             )
-            
+
             tokens_full = self.mrt.codec.encode(loop_for_context).astype(np.int32)
             tokens = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]
-            
+
             context_tokens = make_bar_aligned_context(
-                tokens, 
-                bpm=self.params.bpm, 
+                tokens,
+                bpm=self.params.bpm,
                 fps=int(self.mrt.codec.frame_rate),
-                ctx_frames=self.mrt.config.context_length_frames, 
+                ctx_frames=self.mrt.config.context_length_frames,
                 beats_per_bar=self.params.beats_per_bar
             )
-            
+
+            # Install fresh context
             self.state.context_tokens = context_tokens
             print(f"✅ JamWorker: Set up fresh context from combined loop")
-            
+
+            # NEW: keep a copy of the *original* context tokens for future splice-reseed
+            # (guard so we only set this once, at jam start)
+            with self._lock:
+                if not hasattr(self, "_original_context_tokens") or self._original_context_tokens is None:
+                    self._original_context_tokens = np.copy(context_tokens)  # shape: [T, depth]
+
         except Exception as e:
             print(f"❌ Failed to setup context from combined loop: {e}")
 
@@ -188,6 +195,150 @@ class JamWorker(threading.Thread):
         mixed = tail * eq_out + head * eq_in
 
         self._stream = np.concatenate([self._stream[:-xfade_n], mixed, s[xfade_n:]], axis=0)
+
+    def reseed_from_waveform(self, wav):
+        # 1) Re-init state
+        new_state = self.mrt.init_state()
+
+        # 2) Build bar-aligned context tokens from provided audio
+        codec_fps   = float(self.mrt.codec.frame_rate)
+        ctx_seconds = float(self.mrt.config.context_length_frames) / codec_fps
+        from utils import take_bar_aligned_tail, make_bar_aligned_context
+
+        tail = take_bar_aligned_tail(wav, self.params.bpm, self.params.beats_per_bar, ctx_seconds)
+        tokens_full = self.mrt.codec.encode(tail).astype(np.int32)
+        tokens = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]
+        context_tokens = make_bar_aligned_context(tokens,
+            bpm=self.params.bpm, fps=int(self.mrt.codec.frame_rate),
+            ctx_frames=self.mrt.config.context_length_frames,
+            beats_per_bar=self.params.beats_per_bar
+        )
+        new_state.context_tokens = context_tokens
+        self.state = new_state
+        self._prepare_stream_for_reseed_handoff()
+
+    def _frames_per_bar(self) -> int:
+        # codec frame-rate (frames/s) -> frames per musical bar
+        fps = float(self.mrt.codec.frame_rate)
+        sec_per_bar = (60.0 / float(self.params.bpm)) * float(self.params.beats_per_bar)
+        return int(round(fps * sec_per_bar))
+
+    def _ctx_frames(self) -> int:
+        # how many codec frames fit in the model’s conditioning window
+        return int(self.mrt.config.context_length_frames)
+
+    def _make_recent_tokens_from_wave(self, wav) -> np.ndarray:
+        """
+        Encode a waveform and produce a bar-aligned context token window (same shape/depth
+        as state.context_tokens). Uses your existing codec depth.
+        """
+        tokens_full = self.mrt.codec.encode(wav).astype(np.int32)                  # [T, rvq_total]
+        tokens      = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]     # [T, depth]
+        # If you already have a utility that builds bar-aligned context windows, prefer it.
+        # Otherwise clamp to ctx_frames from the tail (bar-aligned trimming happens in splicer).
+        t = tokens.shape[0]
+        ctx = self._ctx_frames()
+        if t > ctx:
+            tokens = tokens[-ctx:]
+        return tokens
+
+    def _bar_aligned_tail(self, tokens: np.ndarray, bars: float) -> np.ndarray:
+        """
+        Take a tail slice that is an integer number of codec frames corresponding to `bars`.
+        We round to nearest frame to stay phase-consistent with codec grid.
+        """
+        frames_per_bar = self._frames_per_bar()
+        want = max(frames_per_bar * int(round(bars)), 0)
+        if want == 0:
+            return tokens[:0]  # empty
+        if tokens.shape[0] <= want:
+            return tokens
+        return tokens[-want:]
+
+    def _splice_context(self, original_tokens: np.ndarray, recent_tokens: np.ndarray,
+                        anchor_bars: float) -> np.ndarray:
+        """
+        Build new context by concatenating:
+        anchor = tail from originals (anchor_bars)
+        recent = tail from recent_tokens filling the remainder
+        Then clamp to ctx_frames from the tail (safety).
+        """
+        ctx_frames = self._ctx_frames()
+        depth = original_tokens.shape[1]
+
+        # 1) Take bar-aligned tail from original
+        anchor = self._bar_aligned_tail(original_tokens, anchor_bars)              # [A, depth]
+
+        # 2) Compute how many frames remain for recent
+        a = anchor.shape[0]
+        remain = max(ctx_frames - a, 0)
+
+        # 3) Take bar-aligned recent tail not exceeding 'remain' (rounded to bars)
+        if remain > 0:
+            # how many bars fit in remain?
+            frames_per_bar = self._frames_per_bar()
+            recent_bars_fit = int(remain // frames_per_bar)
+            # if we can’t fit even one bar, just take the exact frame remainder
+            if recent_bars_fit >= 1:
+                want_recent_frames = recent_bars_fit * frames_per_bar
+                recent = recent_tokens[-want_recent_frames:] if recent_tokens.shape[0] > want_recent_frames else recent_tokens
+            else:
+                recent = recent_tokens[-remain:] if recent_tokens.shape[0] > remain else recent_tokens
+        else:
+            recent = recent_tokens[:0]
+
+        # 4) Concat and clamp again (exact)
+        out = np.concatenate([anchor, recent], axis=0) if anchor.size or recent.size else recent_tokens[-ctx_frames:]
+        if out.shape[0] > ctx_frames:
+            out = out[-ctx_frames:]
+        # safety on depth
+        if out.shape[1] != depth:
+            out = out[:, :depth]
+        return out
+    
+    def _prepare_stream_for_reseed_handoff(self):
+        """
+        Keep only a tiny tail to crossfade against the FIRST post-reseed chunk.
+        Reset the emit pointer so the next emitted window starts fresh.
+        """
+        sr = int(self.mrt.sample_rate)
+        xfade_s = float(self.mrt.config.crossfade_length)
+        xfade_n = int(round(xfade_s * sr))
+
+        # If we have a stream, keep just a tail to crossfade with
+        if getattr(self, "_stream", None) is not None and self._stream.shape[0] > 0:
+            tail = self._stream[-xfade_n:] if self._stream.shape[0] > xfade_n else self._stream
+            self._stream = tail.copy()
+        else:
+            self._stream = None
+
+        # Start a new emission sequence aligned to the new context
+        self._next_emit_start = 0
+
+    def reseed_splice(self, recent_wav, anchor_bars: float):
+        """
+        Token-splice reseed:
+        - original = the context we captured when the jam started
+        - recent   = tokens from the provided recent waveform (usually Swift-combined mix)
+        - anchor_bars controls how much of the original vibe we re-inject
+        """
+        with self._lock:
+            if not hasattr(self, "_original_context_tokens") or self._original_context_tokens is None:
+                # Fallback: if we somehow don’t have originals, treat current as originals
+                self._original_context_tokens = np.copy(self.state.context_tokens)
+
+            recent_tokens = self._make_recent_tokens_from_wave(recent_wav)          # [T, depth]
+            new_ctx = self._splice_context(self._original_context_tokens, recent_tokens, anchor_bars)
+
+            # install the new context window
+            new_state = self.mrt.init_state()
+            new_state.context_tokens = new_ctx
+            self.state = new_state
+
+            self._prepare_stream_for_reseed_handoff()
+
+            # optional: ask streamer to drop an intro crossfade worth of audio right after reseed
+            self._pending_drop_intro_bars = getattr(self, "_pending_drop_intro_bars", 0) + 1
 
     def run(self):
         """Continuous stream + sliding 8-bar window emitter."""

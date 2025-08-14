@@ -594,6 +594,100 @@ def jam_update(session_id: str = Form(...),
     worker.update_knobs(guidance_weight=guidance_weight, temperature=temperature, topk=topk)
     return {"ok": True}
 
+@app.post("/jam/update_styles")
+def jam_update_styles(session_id: str = Form(...),
+                      styles: str = Form(""),
+                      style_weights: str = Form(""),
+                      loop_weight: float = Form(1.0),
+                      use_current_mix_as_style: bool = Form(False)):
+    with jam_lock:
+        worker = jam_registry.get(session_id)
+    if worker is None or not worker.is_alive():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    embeds, weights = [], []
+    # Optionally re-embed from current combined loop
+    if use_current_mix_as_style and worker.params.combined_loop is not None:
+        embeds.append(worker.mrt.embed_style(worker.params.combined_loop))
+        weights.append(float(loop_weight))
+
+    extra = [s for s in (styles.split(",") if styles else []) if s.strip()]
+    sw = [float(x) for x in style_weights.split(",")] if style_weights else []
+    for i, s in enumerate(extra):
+        embeds.append(worker.mrt.embed_style(s.strip()))
+        weights.append(sw[i] if i < len(sw) else 1.0)
+
+    wsum = sum(weights) or 1.0
+    weights = [w/wsum for w in weights]
+    style_vec = np.sum([w*e for w,e in zip(weights, embeds)], axis=0).astype(np.float32)
+
+    with worker._lock:
+        worker.params.style_vec = style_vec
+
+    return {"ok": True}
+
+@app.post("/jam/reseed")
+def jam_reseed(session_id: str = Form(...), loop_audio: UploadFile = File(None)):
+    with jam_lock:
+        worker = jam_registry.get(session_id)
+    if worker is None or not worker.is_alive():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Option 1: use uploaded new “combined” bounce from the app
+    if loop_audio is not None:
+        data = loop_audio.file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(data); path = tmp.name
+        wav = au.Waveform.from_file(path).resample(worker.mrt.sample_rate).as_stereo()
+    else:
+        # Option 2: reseed from what we’ve been streaming (the model side)
+        # (Usually better to reseed from the Swift-side “combined” mix you trust.)
+
+        s = getattr(worker, "_stream", None)
+        if s is None or s.shape[0] == 0:
+            raise HTTPException(status_code=400, detail="No internal stream to reseed from")
+        wav = au.Waveform(s.astype(np.float32, copy=False), int(worker.mrt.sample_rate)).as_stereo()
+
+    worker.reseed_from_waveform(wav)
+    return {"ok": True}
+
+@app.post("/jam/reseed_splice")
+def jam_reseed_splice(
+    session_id: str = Form(...),
+    anchor_bars: float = Form(2.0),              # how much of the original to re-inject
+    combined_audio: UploadFile = File(None),     # preferred: Swift supplies the current combined mix
+):
+    worker = jam_registry.get(session_id)
+    if worker is None or not worker.is_alive():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Build a waveform to reseed from
+
+    wav = None
+
+    if combined_audio is not None:
+        data = combined_audio.file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty combined_audio")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(data)
+            path = tmp.name
+        wav = au.Waveform.from_file(path).resample(worker.mrt.sample_rate).as_stereo()
+    else:
+        # Fallback: reseed from the model’s internal stream (less ideal than the Swift-side bounce)
+        s = getattr(worker, "_stream", None)
+        if s is None or s.shape[0] == 0:
+            raise HTTPException(status_code=400, detail="No audio available to reseed from")
+        wav = au.Waveform(s.astype(np.float32, copy=False), int(worker.mrt.sample_rate)).as_stereo()
+
+    # Perform the splice reseed
+    worker.reseed_splice(wav, anchor_bars=float(anchor_bars))
+    return {"ok": True, "anchor_bars": float(anchor_bars)}
+
 @app.get("/jam/status")
 def jam_status(session_id: str):
     with jam_lock:
