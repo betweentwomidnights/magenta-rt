@@ -5,7 +5,6 @@ import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
 import soundfile as sf
-import numpy as np
 from math import gcd
 from scipy.signal import resample_poly
 from utils import (
@@ -744,7 +743,7 @@ def read_root():
             <li><code>POST /generate</code> - Generate 4-8 bars of music</li>
             <li><code>POST /jam/start</code> - Start continuous jamming</li>
             <li><code>GET /jam/next</code> - Get next chunk</li>
-            <li><code>GET /jam/consume</code> - confirm a chunk as consumed</li>
+            <li><code>POST /jam/consume</code> - confirm a chunk as consumed</li>
             <li><code>POST /jam/stop</code> - End session</li>
             <li><code>GET /docs</code> - API documentation</li>
         </ul>
