@@ -355,49 +355,74 @@ class JamWorker(threading.Thread):
         chunk_secs = self.params.bars_per_chunk * spb
         xfade = float(self.mrt.config.crossfade_length)  # seconds
 
-        # local fallback stitcher that *keeps* the first head if utils.stitch_generated
-        # doesn't yet support drop_first_pre_roll
-        def _stitch_keep_head(chunks, sr: int, xfade_s: float):
-            from magenta_rt import audio as au
-            import numpy as _np
-            if not chunks:
-                raise ValueError("no chunks to stitch")
-            xfade_n = int(round(max(0.0, xfade_s) * sr))
-            # Fast-path: no crossfade
-            if xfade_n <= 0:
-                out = _np.concatenate([c.samples for c in chunks], axis=0)
-                return au.Waveform(out, sr)
-            # build equal-power curves
-            t = _np.linspace(0, _np.pi / 2, xfade_n, endpoint=False, dtype=_np.float32)
-            eq_in, eq_out = _np.sin(t)[:, None], _np.cos(t)[:, None]
+        # ---- tiny helper: mono + simple envelope ----
+        def _mono_env(x: np.ndarray, sr: int, win_ms: float = 20.0) -> np.ndarray:
+            if x.ndim == 2:
+                x = x.mean(axis=1)
+            x = np.abs(x).astype(np.float32)
+            w = max(1, int(round(win_ms * 1e-3 * sr)))
+            if w == 1:
+                return x
+            kern = np.ones(w, dtype=np.float32) / float(w)
+            # moving average (same length)
+            return np.convolve(x, kern, mode="same")
 
-            first = chunks[0].samples
-            if first.shape[0] < xfade_n:
-                raise ValueError("chunk shorter than crossfade prefix")
-            out = first.copy()  # 👈 keep the head for live seam
+        # ---- estimate how late the first downbeat is (<= max_ms) ----
+        def _estimate_first_offset_samples(ref_loop_wav, gen_wav, sr: int, max_ms: int = 120) -> int:
+            try:
+                # resample ref to model SR if needed
+                ref = ref_loop_wav
+                if ref.sample_rate != sr:
+                    ref = ref.resample(sr)
+                # last 1 bar of the reference (what the model just "heard")
+                n_bar = int(round(spb * sr))
+                ref_tail = ref.samples[-n_bar:, :] if ref.samples.shape[0] >= n_bar else ref.samples
+                # first 2 bars of the generated chunk (search window)
+                gen_head = gen_wav.samples[: int(2 * n_bar), :]
+                if ref_tail.size == 0 or gen_head.size == 0:
+                    return 0
 
-            for i in range(1, len(chunks)):
-                cur = chunks[i].samples
-                if cur.shape[0] < xfade_n:
-                    # too short to crossfade; just butt-join
-                    out = _np.concatenate([out, cur], axis=0)
-                    continue
-                head, tail = cur[:xfade_n], cur[xfade_n:]
-                mixed = out[-xfade_n:] * eq_out + head * eq_in
-                out = _np.concatenate([out[:-xfade_n], mixed, tail], axis=0)
-            return au.Waveform(out, sr)
+                # envelopes
+                e_ref = _mono_env(ref_tail, sr)
+                e_gen = _mono_env(gen_head, sr)
+
+                max_lag = int(round((max_ms / 1000.0) * sr))
+                # ensure the window is long enough
+                seg = min(len(e_ref), len(e_gen))
+                e_ref = e_ref[-seg:]
+                e_gen = e_gen[: seg + max_lag]  # allow positive lag (gen late)
+
+                if len(e_gen) < seg:
+                    return 0
+
+                # brute-force short-range correlation (gen late => positive lag)
+                best_lag = 0
+                best_score = -1e9
+                for lag in range(0, max_lag + 1):
+                    a = e_ref
+                    b = e_gen[lag : lag + seg]
+                    if len(b) != seg:
+                        break
+                    # normalized dot to be robust-ish
+                    denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+                    score = float(np.dot(a, b) / denom)
+                    if score > best_score:
+                        best_score = score
+                        best_lag = lag
+                return int(best_lag)
+            except Exception:
+                return 0
 
         print("🚀 JamWorker started with flow control...")
 
         while not self._stop_event.is_set():
             # Don’t get too far ahead of the consumer
             if not self._should_generate_next_chunk():
-                # We're ahead enough, wait a bit for frontend to catch up
-                # (kept short so stop() stays responsive)
+                print("⏸️  Buffer full, waiting for consumption...")
                 time.sleep(0.5)
                 continue
 
-            # Snapshot knobs + compute index atomically
+            # Snapshot knobs + compute index
             with self._lock:
                 style_vec = self.params.style_vec
                 self.mrt.guidance_weight = float(self.params.guidance_weight)
@@ -409,12 +434,10 @@ class JamWorker(threading.Thread):
             self.last_chunk_started_at = time.time()
 
             # ---- Generate enough model sub-chunks to yield *audible* chunk_secs ----
-            # Count the first chunk at full length L, and each subsequent at (L - xfade)
+            # First sub-chunk contributes full L; subsequent contribute (L - xfade)
             assembled = 0.0
             chunks = []
-
             while assembled < chunk_secs and not self._stop_event.is_set():
-                # generate_chunk returns (au.Waveform, new_state)
                 wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
                 chunks.append(wav)
                 L = wav.samples.shape[0] / float(self.mrt.sample_rate)
@@ -423,27 +446,30 @@ class JamWorker(threading.Thread):
             if self._stop_event.is_set():
                 break
 
-            # ---- Stitch and trim at model SR (keep first head for seamless handoff) ----
-            try:
-                # Preferred path if you've added the new param in utils.stitch_generated
-                y = stitch_generated(chunks, self.mrt.sample_rate, xfade, drop_first_pre_roll=False).as_stereo()
-            except TypeError:
-                # Backward-compatible: local stitcher that keeps the head
-                y = _stitch_keep_head(chunks, int(self.mrt.sample_rate), xfade).as_stereo()
-
-            # Hard trim to the exact musical duration (still at model SR)
+            # ---- Stitch (utils drops the very first model pre-roll) & trim at model SR ----
+            y = stitch_generated(chunks, self.mrt.sample_rate, xfade).as_stereo()
             y = hard_trim_seconds(y, chunk_secs)
+
+            # ---- ONE-TIME: grid-align the very first jam chunk to kill the flam ----
+            if next_idx == 1 and self.params.combined_loop is not None:
+                offset = _estimate_first_offset_samples(
+                    self.params.combined_loop, y, int(self.mrt.sample_rate), max_ms=120
+                )
+                if offset > 0:
+                    # Trim the head by the detected offset; we'll snap length later
+                    y.samples = y.samples[offset:, :]
+                    print(f"🎯 First-chunk offset compensation: -{offset/self.mrt.sample_rate:.3f}s")
+                # hard trim again (defensive), remaining length exactness happens in _snap_and_encode
+                y = hard_trim_seconds(y, chunk_secs)
 
             # ---- Post-processing ----
             if next_idx == 1 and self.params.ref_loop is not None:
-                # match loudness to the provided reference on the very first audible chunk
                 y, _ = match_loudness_to_reference(
                     self.params.ref_loop, y,
                     method=self.params.loudness_mode,
                     headroom_db=self.params.headroom_db
                 )
             else:
-                # light micro-fades to guard against clicks
                 apply_micro_fades(y, 3)
 
             # ---- Resample + bar-snap + encode ----
@@ -453,14 +479,12 @@ class JamWorker(threading.Thread):
                 target_sr=self.params.target_sr,
                 bars=self.params.bars_per_chunk
             )
-            # small hint for the client if you want UI butter between chunks
-            meta["xfade_seconds"] = xfade
+            meta["xfade_seconds"] = xfade  # tiny hint for client if you want butter at chunk joins
 
-            # ---- Publish the completed chunk ----
+            # ---- Publish ----
             with self._lock:
                 self.idx = next_idx
                 self.outbox.append(JamChunk(index=next_idx, audio_base64=b64, metadata=meta))
-                # Keep outbox bounded (trim far-behind entries)
                 if len(self.outbox) > 10:
                     cutoff = self._last_delivered_index - 5
                     self.outbox = [ch for ch in self.outbox if ch.index > cutoff]
@@ -469,3 +493,4 @@ class JamWorker(threading.Thread):
             print(f"✅ Completed chunk {next_idx}")
 
         print("🛑 JamWorker stopped")
+
