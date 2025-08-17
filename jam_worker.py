@@ -355,61 +355,77 @@ class JamWorker(threading.Thread):
         chunk_secs = self.params.bars_per_chunk * spb
         xfade = float(self.mrt.config.crossfade_length)  # seconds
 
-        # ---- tiny helper: mono + simple envelope ----
-        def _mono_env(x: np.ndarray, sr: int, win_ms: float = 20.0) -> np.ndarray:
+        def _mono_env(x: np.ndarray, sr: int, win_ms: float = 10.0) -> np.ndarray:
+            """Rectified moving-average envelope, then a simple onset-y novelty (half-wave diff)."""
             if x.ndim == 2:
                 x = x.mean(axis=1)
             x = np.abs(x).astype(np.float32)
             w = max(1, int(round(win_ms * 1e-3 * sr)))
-            if w == 1:
-                return x
-            kern = np.ones(w, dtype=np.float32) / float(w)
-            # moving average (same length)
-            return np.convolve(x, kern, mode="same")
+            if w > 1:
+                kern = np.ones(w, dtype=np.float32) / float(w)
+                x = np.convolve(x, kern, mode="same")
+            # onset-ish novelty: positive first difference (half-wave)
+            d = np.diff(x, prepend=x[:1])
+            d[d < 0] = 0.0
+            return d
 
-        # ---- estimate how late the first downbeat is (<= max_ms) ----
-        def _estimate_first_offset_samples(ref_loop_wav, gen_wav, sr: int, max_ms: int = 120) -> int:
+        def _estimate_first_offset_samples(ref_loop_wav, gen_wav, sr: int, spb: float, max_ms: int = 180) -> int:
+            """
+            Estimate how late/early the first downbeat is by correlating
+            the last bar of the reference vs the first two bars of the generated chunk.
+            Allows small +/- offsets; upsample envelopes x4 for sub-sample precision then round.
+            """
             try:
-                # resample ref to model SR if needed
-                ref = ref_loop_wav
-                if ref.sample_rate != sr:
-                    ref = ref.resample(sr)
-                # last 1 bar of the reference (what the model just "heard")
+                ref = ref_loop_wav if ref_loop_wav.sample_rate == sr else ref_loop_wav.resample(sr)
                 n_bar = int(round(spb * sr))
+
                 ref_tail = ref.samples[-n_bar:, :] if ref.samples.shape[0] >= n_bar else ref.samples
-                # first 2 bars of the generated chunk (search window)
                 gen_head = gen_wav.samples[: int(2 * n_bar), :]
                 if ref_tail.size == 0 or gen_head.size == 0:
                     return 0
 
-                # envelopes
-                e_ref = _mono_env(ref_tail, sr)
-                e_gen = _mono_env(gen_head, sr)
+                e_ref = _mono_env(ref_tail, sr)     # length ~ n_bar
+                e_gen = _mono_env(gen_head, sr)     # length ~ 2*n_bar
 
-                max_lag = int(round((max_ms / 1000.0) * sr))
-                # ensure the window is long enough
-                seg = min(len(e_ref), len(e_gen))
-                e_ref = e_ref[-seg:]
-                e_gen = e_gen[: seg + max_lag]  # allow positive lag (gen late)
+                # z-score for scale invariance
+                def _z(a):
+                    m, s = float(a.mean()), float(a.std() or 1.0)
+                    return (a - m) / s
+                e_ref = _z(e_ref).astype(np.float32)
+                e_gen = _z(e_gen).astype(np.float32)
 
-                if len(e_gen) < seg:
-                    return 0
+                # Light upsampling for finer lag resolution (x4)
+                def _upsample(a, r=4):
+                    n = len(a)
+                    grid = np.arange(n, dtype=np.float32)
+                    fine = np.linspace(0, n - 1, num=n * r, dtype=np.float32)
+                    return np.interp(fine, grid, a).astype(np.float32)
+                up = 4
+                e_ref_u = _upsample(e_ref, up)
+                e_gen_u = _upsample(e_gen, up)
 
-                # brute-force short-range correlation (gen late => positive lag)
-                best_lag = 0
-                best_score = -1e9
-                for lag in range(0, max_lag + 1):
-                    a = e_ref
-                    b = e_gen[lag : lag + seg]
-                    if len(b) != seg:
-                        break
-                    # normalized dot to be robust-ish
-                    denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
-                    score = float(np.dot(a, b) / denom)
+                # Correlate in a tight window
+                max_lag_u = int(round((max_ms / 1000.0) * sr * up))
+                seg = min(len(e_ref_u), len(e_gen_u))
+                e_ref_u = e_ref_u[-seg:]
+                # pad head so we can slide +/- lags
+                pad = np.zeros(max_lag_u, dtype=np.float32)
+                e_gen_u_pad = np.concatenate([pad, e_gen_u, pad])
+
+                best_lag_u, best_score = 0, -1e9
+                # allow tiny early OR late (negative = model early, positive = late)
+                for lag_u in range(-max_lag_u, max_lag_u + 1):
+                    start = max_lag_u + lag_u
+                    b = e_gen_u_pad[start : start + seg]
+                    # normalized dot (already z-scored, but keep it consistent)
+                    denom = (np.linalg.norm(e_ref_u) * np.linalg.norm(b)) or 1.0
+                    score = float(np.dot(e_ref_u, b) / denom)
                     if score > best_score:
-                        best_score = score
-                        best_lag = lag
-                return int(best_lag)
+                        best_score, best_lag_u = score, lag_u
+
+                # convert envelope-lag back to audio samples and round
+                lag_samples = int(round(best_lag_u / up))
+                return lag_samples
             except Exception:
                 return 0
 
@@ -453,13 +469,16 @@ class JamWorker(threading.Thread):
             # ---- ONE-TIME: grid-align the very first jam chunk to kill the flam ----
             if next_idx == 1 and self.params.combined_loop is not None:
                 offset = _estimate_first_offset_samples(
-                    self.params.combined_loop, y, int(self.mrt.sample_rate), max_ms=120
+                    self.params.combined_loop, y, int(self.mrt.sample_rate), spb, max_ms=180  # try 160–200
                 )
-                if offset > 0:
-                    # Trim the head by the detected offset; we'll snap length later
-                    y.samples = y.samples[offset:, :]
-                    print(f"🎯 First-chunk offset compensation: -{offset/self.mrt.sample_rate:.3f}s")
-                # hard trim again (defensive), remaining length exactness happens in _snap_and_encode
+                if offset != 0:
+                    # positive => model late: trim head; negative => model early: pad head (rare)
+                    if offset > 0:
+                        y.samples = y.samples[offset:, :]
+                    else:
+                        pad = np.zeros((abs(offset), y.samples.shape[1]), dtype=y.samples.dtype)
+                        y.samples = np.concatenate([pad, y.samples], axis=0)
+                    print(f"🎯 First-chunk offset compensation: {offset/self.mrt.sample_rate:+.3f}s")
                 y = hard_trim_seconds(y, chunk_secs)
 
             # ---- Post-processing ----
