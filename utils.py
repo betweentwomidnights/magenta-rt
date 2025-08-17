@@ -69,7 +69,7 @@ def match_loudness_to_reference(
 
 
 # ---------- Stitch / fades / trims ----------
-def stitch_generated(chunks, sr: int, xfade_s: float) -> au.Waveform:
+def stitch_generated(chunks, sr: int, xfade_s: float, drop_first_pre_roll: bool = True):
     if not chunks:
         raise ValueError("no chunks")
     xfade_n = int(round(xfade_s * sr))
@@ -82,7 +82,9 @@ def stitch_generated(chunks, sr: int, xfade_s: float) -> au.Waveform:
     first = chunks[0].samples
     if first.shape[0] < xfade_n:
         raise ValueError("chunk shorter than crossfade prefix")
-    out = first[xfade_n:].copy()  # drop model pre-roll
+
+    # 🔧 key change:
+    out = first[xfade_n:].copy() if drop_first_pre_roll else first.copy()
 
     for i in range(1, len(chunks)):
         cur = chunks[i].samples
