@@ -17,6 +17,7 @@ from jam_worker import JamWorker, JamParams, JamChunk
 import uuid, threading
 
 import gradio as gr
+from typing import Optional
 
 def create_documentation_interface():
     """Create a Gradio interface for documentation and transparency"""
@@ -581,47 +582,60 @@ def jam_stop(session_id: str = Body(..., embed=True)):
         jam_registry.pop(session_id, None)
     return {"stopped": True}
 
-@app.post("/jam/update")
-def jam_update(session_id: str = Form(...),
-               guidance_weight: float | None = Form(None),
-               temperature: float | None = Form(None),
-               topk: int | None = Form(None)):
+@app.post("/jam/update")  # consolidated
+def jam_update(
+    session_id: str = Form(...),
+
+    # knobs (all optional)
+    guidance_weight: Optional[float] = Form(None),
+    temperature: Optional[float]     = Form(None),
+    topk: Optional[int]              = Form(None),
+
+    # styles (all optional)
+    styles: str                      = Form(""),
+    style_weights: str               = Form(""),
+    loop_weight: Optional[float]     = Form(None),   # None means "don’t change"
+    use_current_mix_as_style: bool   = Form(False),
+):
     with jam_lock:
         worker = jam_registry.get(session_id)
     if worker is None or not worker.is_alive():
         raise HTTPException(status_code=404, detail="Session not found")
-    worker.update_knobs(guidance_weight=guidance_weight, temperature=temperature, topk=topk)
-    return {"ok": True}
 
-@app.post("/jam/update_styles")
-def jam_update_styles(session_id: str = Form(...),
-                      styles: str = Form(""),
-                      style_weights: str = Form(""),
-                      loop_weight: float = Form(1.0),
-                      use_current_mix_as_style: bool = Form(False)):
-    with jam_lock:
-        worker = jam_registry.get(session_id)
-    if worker is None or not worker.is_alive():
-        raise HTTPException(status_code=404, detail="Session not found")
+    # --- 1) Apply knob updates (atomic under lock)
+    if any(v is not None for v in (guidance_weight, temperature, topk)):
+        worker.update_knobs(
+            guidance_weight=guidance_weight,
+            temperature=temperature,
+            topk=topk
+        )
 
-    embeds, weights = [], []
-    # Optionally re-embed from current combined loop
-    if use_current_mix_as_style and worker.params.combined_loop is not None:
-        embeds.append(worker.mrt.embed_style(worker.params.combined_loop))
-        weights.append(float(loop_weight))
+    # --- 2) Apply style updates only if requested
+    wants_style_update = use_current_mix_as_style or (styles.strip() != "")
+    if wants_style_update:
+        embeds, weights = [], []
 
-    extra = [s for s in (styles.split(",") if styles else []) if s.strip()]
-    sw = [float(x) for x in style_weights.split(",")] if style_weights else []
-    for i, s in enumerate(extra):
-        embeds.append(worker.mrt.embed_style(s.strip()))
-        weights.append(sw[i] if i < len(sw) else 1.0)
+        # optional: include current mix as a style component
+        if use_current_mix_as_style and worker.params.combined_loop is not None:
+            lw = 1.0 if loop_weight is None else float(loop_weight)
+            embeds.append(worker.mrt.embed_style(worker.params.combined_loop))
+            weights.append(lw)
 
-    wsum = sum(weights) or 1.0
-    weights = [w/wsum for w in weights]
-    style_vec = np.sum([w*e for w,e in zip(weights, embeds)], axis=0).astype(np.float32)
+        # extra text styles
+        extra = [s for s in (styles.split(",") if styles else []) if s.strip()]
+        sw = [float(x) for x in style_weights.split(",")] if style_weights else []
+        for i, s in enumerate(extra):
+            embeds.append(worker.mrt.embed_style(s.strip()))
+            weights.append(sw[i] if i < len(sw) else 1.0)
 
-    with worker._lock:
-        worker.params.style_vec = style_vec
+        if embeds:  # only swap if we actually built something
+            wsum = sum(weights) or 1.0
+            weights = [w / wsum for w in weights]
+            style_vec = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
+            # install atomically
+            with worker._lock:
+                worker.params.style_vec = style_vec
 
     return {"ok": True}
 
