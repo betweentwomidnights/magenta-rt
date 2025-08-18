@@ -1,6 +1,6 @@
 from magenta_rt import system, audio as au
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
@@ -740,6 +740,22 @@ def jam_status(session_id: str):
 
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID", "-")
+    print(f"📥 {request.method} {request.url.path}?{request.url.query} [rid={rid}]")
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        print(f"💥 exception for {request.url.path} [rid={rid}]: {e}")
+        raise
+    print(f"📤 {response.status_code} {request.url.path} [rid={rid}]")
+    return response
+
+@app.get("/ping")
+def ping():
     return {"ok": True}
 
 @app.get("/", response_class=Response)
