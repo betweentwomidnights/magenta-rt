@@ -355,7 +355,7 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                _MRT = system.MagentaRT(tag="base", guidance_weight=1.0, device="gpu", lazy=False)
+                _MRT = system.MagentaRT(tag="large", guidance_weight=1.0, device="gpu", lazy=False)
     return _MRT
 
 @app.post("/generate")
