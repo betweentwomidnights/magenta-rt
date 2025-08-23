@@ -29,6 +29,12 @@ RUN set -eux; \
 # (optional) preload workaround if still needed
 ENV LD_PRELOAD=/usr/local/cuda/lib64/libcusparse.so.12:/usr/local/cuda/lib64/libcublas.so.12:/usr/local/cuda/lib64/libcublasLt.so.12:/usr/local/cuda/lib64/libcufft.so.11:/usr/local/cuda/lib64/libcusolver.so.11
 
+# Better allocator (less fragmentation than BFC during XLA autotune)
+ENV TF_GPU_ALLOCATOR=cuda_malloc_async
+
+# Let cuBLAS use TF32 fast path on Ada (L40S) for big GEMMs
+ENV TF_ENABLE_CUBLAS_TF32=1 NVIDIA_TF32_OVERRIDE=1
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
