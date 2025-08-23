@@ -116,6 +116,9 @@ for pat in patterns:
 print("TF/Hub/Text cleared in:", site)
 PY
 
+RUN python -m pip install --no-cache-dir --force-reinstall \
+    "jax==0.6.2" "jaxlib==0.6.2" "jax[cuda12]==0.6.2"
+
 # Reinstall pinned nightlies in ONE transaction
 RUN python -m pip install --no-cache-dir --force-reinstall \
     "tf-nightly==2.20.0.dev20250619" \
@@ -128,8 +131,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall "protobuf==4.25.3"
 
 RUN python -m pip install gradio
 
-RUN python -m pip install --no-cache-dir --force-reinstall \
-    "jax==0.7.1" "jaxlib==0.7.1" "jax[cuda12]==0.7.1"
+
 
 # Switch to Spaces’ preferred user
 # Switch to Spaces’ preferred user
