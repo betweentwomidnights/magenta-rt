@@ -15,6 +15,8 @@ from utils import (
 
 from jam_worker import JamWorker, JamParams, JamChunk
 import uuid, threading
+import os
+import logging
 
 import gradio as gr
 from typing import Optional
@@ -357,6 +359,82 @@ def get_mrt():
             if _MRT is None:
                 _MRT = system.MagentaRT(tag="large", guidance_weight=5.0, device="gpu", lazy=False)
     return _MRT
+
+_WARMED = False
+_WARMUP_LOCK = threading.Lock()
+
+def _mrt_warmup():
+    """
+    Build a minimal, bar-aligned silent context and run one 2s generate_chunk
+    to trigger XLA JIT & autotune so first real request is fast.
+    """
+    global _WARMED
+    with _WARMUP_LOCK:
+        if _WARMED:
+            return
+        try:
+            mrt = get_mrt()
+
+            # --- derive timing from model config ---
+            codec_fps = float(mrt.codec.frame_rate)
+            ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
+            sr = int(mrt.sample_rate)
+
+            # We'll align to 120 BPM, 4/4, and generate one ~2s chunk
+            bpm = 120.0
+            beats_per_bar = 4
+
+            # --- build a silent, stereo context of ctx_seconds ---
+            import numpy as np, soundfile as sf
+            samples = int(max(1, round(ctx_seconds * sr)))
+            silent = np.zeros((samples, 2), dtype=np.float32)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                sf.write(tmp.name, silent, sr, subtype="PCM_16")
+                tmp_path = tmp.name
+
+            try:
+                # Load as Waveform and take a tail of exactly ctx_seconds
+                loop = au.Waveform.from_file(tmp_path).resample(sr).as_stereo()
+                seconds_per_bar = beats_per_bar * (60.0 / bpm)
+                ctx_tail = take_bar_aligned_tail(loop, bpm, beats_per_bar, ctx_seconds)
+
+                # Tokens for context window
+                tokens_full = mrt.codec.encode(ctx_tail).astype(np.int32)
+                tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
+                context_tokens = make_bar_aligned_context(
+                    tokens,
+                    bpm=bpm,
+                    fps=int(mrt.codec.frame_rate),
+                    ctx_frames=mrt.config.context_length_frames,
+                    beats_per_bar=beats_per_bar,
+                )
+
+                # Init state and a basic style vector (text token is fine)
+                state = mrt.init_state()
+                state.context_tokens = context_tokens
+                style_vec = mrt.embed_style("warmup")
+
+                # --- one throwaway chunk (~2s) ---
+                _wav, _state = mrt.generate_chunk(state=state, style=style_vec)
+
+                logging.info("MagentaRT warmup complete.")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+            _WARMED = True
+        except Exception as e:
+            # Never crash on warmup errors; log and continue serving
+            logging.exception("MagentaRT warmup failed (continuing without warmup): %s", e)
+
+# Kick it off in the background on server start
+@app.on_event("startup")
+def _kickoff_warmup():
+    if os.getenv("MRT_WARMUP", "1") != "0":
+        threading.Thread(target=_mrt_warmup, name="mrt-warmup", daemon=True).start()
 
 @app.post("/generate")
 def generate(
