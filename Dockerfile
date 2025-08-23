@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 
 # CUDA libs present + on loader path
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cuda-libraries-12-4 && rm -rf /var/lib/apt/lists/*
+    cuda-libraries-12-6 && rm -rf /var/lib/apt/lists/*
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda-12.4/lib64:/usr/local/cuda-12.4/compat:/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
 RUN ln -sf /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda/lib64 || true
 
