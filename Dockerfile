@@ -33,7 +33,7 @@ ENV LD_PRELOAD=/usr/local/cuda/lib64/libcusparse.so.12:/usr/local/cuda/lib64/lib
 ENV TF_GPU_ALLOCATOR=cuda_malloc_async
 
 # Let cuBLAS use TF32 fast path on Ada (L40S) for big GEMMs
-ENV TF_ENABLE_CUBLAS_TF32=1 NVIDIA_TF32_OVERRIDE=1
+# ENV TF_ENABLE_CUBLAS_TF32=1 NVIDIA_TF32_OVERRIDE=1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
