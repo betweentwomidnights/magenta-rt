@@ -1,0 +1,42 @@
+[project]
+name = "mrt-app"
+version = "0.0.1"
+requires-python = ">=3.11"
+
+dependencies = [
+  # core, pinned to avoid drift
+  "numpy==2.1.3",
+  "seqio==0.0.11",
+  "gin-config",
+  "librosa",
+  "resampy",
+  "soundfile",
+  "tqdm",
+  "typing-extensions",
+  "requests",
+  "fastapi",
+  "uvicorn[standard]",
+  "pyloudnorm",
+  "protobuf==4.25.3",
+
+  # tensorflow nightlies (your chosen dates)
+  "tf-nightly==2.20.0.dev20250619",
+  "tensorflow-text-nightly==2.20.0.dev20250316",
+  "tf-hub-nightly",
+  "tf2jax",
+
+  # research libs at fixed commits
+  "t5x @ git+https://github.com/google-research/t5x.git@92c5b46",
+  "flaxformer @ git+https://github.com/google/flaxformer@399ea3a",
+
+  # install Magenta RT from git with the GPU extra
+  "magenta_rt[gpu] @ git+https://github.com/magenta/magenta-realtime",
+]
+
+[tool.uv]  # optional, but handy
+override = [
+  # keep the JAX triplet in lockstep explicitly
+  "jax==0.7.1",
+  "jaxlib==0.7.1",
+  "jax-cuda12-plugin==0.7.1",
+]
