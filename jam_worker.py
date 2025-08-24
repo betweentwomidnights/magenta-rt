@@ -80,7 +80,7 @@ class JamWorker(threading.Thread):
             context_tokens = make_bar_aligned_context(
                 tokens,
                 bpm=self.params.bpm,
-                fps=int(self.mrt.codec.frame_rate),
+                fps=float(self.mrt.codec.frame_rate),  # keep fractional fps
                 ctx_frames=self.mrt.config.context_length_frames,
                 beats_per_bar=self.params.beats_per_bar
             )
@@ -213,7 +213,7 @@ class JamWorker(threading.Thread):
         tokens_full = self.mrt.codec.encode(tail).astype(np.int32)
         tokens = tokens_full[:, :self.mrt.config.decoder_codec_rvq_depth]
         context_tokens = make_bar_aligned_context(tokens,
-            bpm=self.params.bpm, fps=int(self.mrt.codec.frame_rate),
+            bpm=self.params.bpm, fps=float(self.mrt.codec.frame_rate),
             ctx_frames=self.mrt.config.context_length_frames,
             beats_per_bar=self.params.beats_per_bar
         )
@@ -242,7 +242,7 @@ class JamWorker(threading.Thread):
         ctx = make_bar_aligned_context(
             tokens,
             bpm=self.params.bpm,
-            fps=int(self.mrt.codec.frame_rate),
+            fps=float(self.mrt.codec.frame_rate),  # keep fractional fps
             ctx_frames=self.mrt.config.context_length_frames,
             beats_per_bar=self.params.beats_per_bar
         )

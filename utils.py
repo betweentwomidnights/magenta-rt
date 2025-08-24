@@ -109,30 +109,99 @@ def apply_micro_fades(wav: au.Waveform, ms: int = 5) -> None:
 
 
 # ---------- Token context helpers ----------
-def make_bar_aligned_context(tokens, bpm, fps=25, ctx_frames=250, beats_per_bar=4):
-    frames_per_bar_f = (beats_per_bar * 60.0 / bpm) * fps
-    frames_per_bar = int(round(frames_per_bar_f))
-    if abs(frames_per_bar - frames_per_bar_f) > 1e-3:
-        reps = int(np.ceil(ctx_frames / len(tokens)))
-        return np.tile(tokens, (reps, 1))[-ctx_frames:]
-    reps = int(np.ceil(ctx_frames / len(tokens)))
-    tiled = np.tile(tokens, (reps, 1))
-    end = (len(tiled) // frames_per_bar) * frames_per_bar
-    if end < ctx_frames:
-        return tiled[-ctx_frames:]
-    start = end - ctx_frames
-    return tiled[start:end]
+def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_bar=4):
+    """
+    Return a ctx_frames-long slice of `tokens` whose **end** lands on the nearest
+    whole-bar boundary in codec-frame space, even when frames_per_bar is fractional.
 
-def take_bar_aligned_tail(wav: au.Waveform, bpm: float, beats_per_bar: int, ctx_seconds: float, max_bars=None) -> au.Waveform:
-    spb = (60.0 / bpm) * beats_per_bar
-    bars_needed = max(1, int(round(ctx_seconds / spb)))
+    tokens: np.ndarray of shape (T, D) or (T,) where T = codec frames
+    bpm: float
+    fps: float (codec frames per second; keep this as float)
+    ctx_frames: int (length of context window in codec frames)
+    beats_per_bar: int
+    """
+ 
+
+    if tokens is None:
+        raise ValueError("tokens is None")
+    tokens = np.asarray(tokens)
+    if tokens.ndim == 1:
+        tokens = tokens[:, None]  # promote to (T, 1) for uniform tiling
+
+    T = tokens.shape[0]
+    if T == 0:
+        return tokens
+
+    fps = float(fps)
+    frames_per_bar_f = (beats_per_bar * 60.0 / float(bpm)) * fps  # float frames per bar
+
+    # Tile a little more than we need so we can always snap the END to a bar boundary
+    reps = int(np.ceil((ctx_frames + T) / float(T))) + 1
+    tiled = np.tile(tokens, (reps, 1))
+    total = tiled.shape[0]
+
+    # How many whole bars fit?
+    k_bars = int(np.floor(total / frames_per_bar_f))
+    if k_bars <= 0:
+        # Fallback: just take the last ctx_frames
+        window = tiled[-ctx_frames:]
+        return window
+
+    # Snap END index to the nearest integer frame at a whole-bar boundary
+    end_idx = int(round(k_bars * frames_per_bar_f))
+    end_idx = min(max(end_idx, ctx_frames), total)
+    start_idx = end_idx - ctx_frames
+    if start_idx < 0:
+        start_idx = 0
+        end_idx = ctx_frames
+
+    window = tiled[start_idx:end_idx]
+
+    # Guard against rare off-by-one due to rounding
+    if window.shape[0] < ctx_frames:
+        pad = np.tile(tokens, (int(np.ceil((ctx_frames - window.shape[0]) / T)), 1))
+        window = np.vstack([window, pad])[:ctx_frames]
+    elif window.shape[0] > ctx_frames:
+        window = window[-ctx_frames:]
+
+    return window
+
+
+def take_bar_aligned_tail(
+    wav: au.Waveform,
+    bpm: float,
+    beats_per_bar: int,
+    ctx_seconds: float,
+    max_bars=None
+) -> au.Waveform:
+    """
+    Take a tail whose length is an integer number of bars, with the END aligned
+    to a bar boundary. Uses ceil for bars_needed so we never under-fill the context.
+    """
+    import math
+
+    # seconds per bar
+    spb = (60.0 / float(bpm)) * float(beats_per_bar)
+
+    # Pick enough whole bars to cover ctx_seconds (avoid underfilling on round-down).
+    # The small epsilon avoids an extra bar due to FP jitter when ctx_seconds ~= k * spb.
+    eps = 1e-9
+    bars_needed = max(1, int(math.ceil((float(ctx_seconds) - eps) / spb)))
+
     if max_bars is not None:
-        bars_needed = min(bars_needed, max_bars)
-    tail_seconds = bars_needed * spb
-    n = int(round(tail_seconds * wav.sample_rate))
-    if n >= wav.samples.shape[0]:
+        bars_needed = min(bars_needed, int(max_bars))
+
+    # Convert bars -> samples (do rounding once at the end for stability)
+    samples_per_bar_f = spb * float(wav.sample_rate)
+    n = int(round(bars_needed * samples_per_bar_f))
+
+    total = int(wav.samples.shape[0])
+    if n >= total:
+        # Not enough audio to take that many bars—return as-is (current behavior).
         return wav
-    return au.Waveform(wav.samples[-n:], wav.sample_rate)
+
+    start = total - n
+    return au.Waveform(wav.samples[start:], wav.sample_rate)
 
 
 # ---------- SR normalize + snap ----------
