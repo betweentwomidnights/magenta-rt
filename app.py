@@ -21,6 +21,42 @@ import logging
 import gradio as gr
 from typing import Optional
 
+# --- Patch T5X mesh helpers for GPUs on JAX >= 0.7 (coords present, no core_on_chip) ---
+def _patch_t5x_for_gpu_coords():
+    try:
+        import jax
+        from t5x import partitioning as _t5x_part
+
+        old_bounds = getattr(_t5x_part, "bounds_from_last_device", None)
+        old_getcoords = getattr(_t5x_part, "get_coords", None)
+
+        def _bounds_from_last_device_gpu_safe(last_device):
+            # TPU: coords + core_on_chip
+            core = getattr(last_device, "core_on_chip", None)
+            coords = getattr(last_device, "coords", None)
+            if coords is not None and core is not None:
+                x, y, z = coords
+                return x + 1, y + 1, z + 1, core + 1
+            # Non-TPU (or GPU lacking core_on_chip): hosts x local_devices
+            return jax.host_count(), jax.local_device_count()
+
+        def _get_coords_gpu_safe(device):
+            core = getattr(device, "core_on_chip", None)
+            coords = getattr(device, "coords", None)
+            if coords is not None and core is not None:
+                return (*coords, core)
+            # Fallback that works on CPU/GPU
+            return (device.process_index, device.id % jax.local_device_count())
+
+        _t5x_part.bounds_from_last_device = _bounds_from_last_device_gpu_safe
+        _t5x_part.get_coords = _get_coords_gpu_safe
+        import logging; logging.info("Patched t5x.partitioning for GPU coords without core_on_chip.")
+    except Exception as e:
+        import logging; logging.exception("t5x GPU-coords patch failed: %s", e)
+
+# Call the patch immediately at import time (before MagentaRT init)
+_patch_t5x_for_gpu_coords()
+
 def create_documentation_interface():
     """Create a Gradio interface for documentation and transparency"""
     
