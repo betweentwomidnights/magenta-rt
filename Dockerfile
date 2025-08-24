@@ -58,7 +58,7 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python && python -m pip install --upgrad
 
 # --- Python deps (pin order matters!) ---
 # 1) JAX CUDA pins
-RUN python -m pip install "jax[cuda12]==0.6.2" "jaxlib==0.6.2"
+RUN python -m pip install "jax[cuda12]==0.7.1" "jaxlib==0.7.1"
 
 # 2) Lock seqio early to avoid backtracking madness
 RUN python -m pip install "seqio==0.0.11"
@@ -121,8 +121,6 @@ RUN python -m pip install --no-cache-dir --force-reinstall \
     "tf-nightly==2.20.0.dev20250619" \
     "tensorflow-text-nightly==2.20.0.dev20250316" \
     "tf-hub-nightly"
-
-RUN python -m pip install "jaxlib==0.6.2"
 
 RUN python -m pip install huggingface_hub
 
