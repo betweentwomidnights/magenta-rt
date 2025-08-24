@@ -271,35 +271,88 @@ class JamWorker(threading.Thread):
         depth = original_tokens.shape[1]
         frames_per_bar = self._frames_per_bar()
 
-        # 1) Anchor tail
-        # Use floor, not round, to avoid grabbing an extra bar.
+        # 1) Anchor tail (whole bars)
         anchor = self._bar_aligned_tail(original_tokens, math.floor(anchor_bars))
 
-        # 2) Fill remainder with recent (in whole bars when possible)
+        # 2) Fill remainder with recent (prefer whole bars)
         a = anchor.shape[0]
         remain = max(ctx_frames - a, 0)
+
+        recent = recent_tokens[:0]
+        used_recent = 0  # frames taken from the END of recent_tokens
         if remain > 0:
             bars_fit = remain // frames_per_bar
             if bars_fit >= 1:
                 want_recent_frames = int(bars_fit * frames_per_bar)
-                recent = recent_tokens[-want_recent_frames:] if recent_tokens.shape[0] > want_recent_frames else recent_tokens
+                used_recent = min(want_recent_frames, recent_tokens.shape[0])
+                recent = recent_tokens[-used_recent:] if used_recent > 0 else recent_tokens[:0]
             else:
-                recent = recent_tokens[-remain:] if recent_tokens.shape[0] > remain else recent_tokens
-        else:
-            recent = recent_tokens[:0]
+                used_recent = min(remain, recent_tokens.shape[0])
+                recent = recent_tokens[-used_recent:] if used_recent > 0 else recent_tokens[:0]
 
-        out = np.concatenate([anchor, recent], axis=0) if (anchor.size or recent.size) else recent_tokens[-ctx_frames:]
+        # 3) Concat in order [anchor, recent]
+        if anchor.size or recent.size:
+            out = np.concatenate([anchor, recent], axis=0)
+        else:
+            # fallback: just take the last ctx window from recent
+            out = recent_tokens[-ctx_frames:]
+
+        # 4) Trim if we overshot
         if out.shape[0] > ctx_frames:
             out = out[-ctx_frames:]
 
-        # --- NEW: force total length to a whole number of bars
-        max_bar_aligned = (out.shape[0] // frames_per_bar) * frames_per_bar
+        # 5) Snap the **END** to the nearest LOWER bar boundary
+        if frames_per_bar > 0:
+            max_bar_aligned = (out.shape[0] // frames_per_bar) * frames_per_bar
+        else:
+            max_bar_aligned = out.shape[0]
         if max_bar_aligned > 0 and out.shape[0] != max_bar_aligned:
             out = out[-max_bar_aligned:]
 
+        # 6) Left-fill to reach ctx_frames **without moving the END**
+        deficit = ctx_frames - out.shape[0]
+        if deficit > 0:
+            left_parts = []
+
+            # Prefer frames immediately BEFORE the region we used from 'recent_tokens'
+            if used_recent < recent_tokens.shape[0]:
+                take = min(deficit, recent_tokens.shape[0] - used_recent)
+                if used_recent > 0:
+                    left_parts.append(recent_tokens[-(used_recent + take) : -used_recent])
+                else:
+                    left_parts.append(recent_tokens[-take:])
+
+            # Then take frames immediately BEFORE the 'anchor' in original_tokens
+            if sum(p.shape[0] for p in left_parts) < deficit and anchor.shape[0] > 0:
+                need = deficit - sum(p.shape[0] for p in left_parts)
+                a_len = anchor.shape[0]
+                avail = max(original_tokens.shape[0] - a_len, 0)
+                take2 = min(need, avail)
+                if take2 > 0:
+                    left_parts.append(original_tokens[-(a_len + take2) : -a_len])
+
+            # Still short? tile from what's available
+            have = sum(p.shape[0] for p in left_parts)
+            if have < deficit:
+                base = out if out.shape[0] > 0 else (recent_tokens if recent_tokens.shape[0] > 0 else original_tokens)
+                reps = int(np.ceil((deficit - have) / max(1, base.shape[0])))
+                left_parts.append(np.tile(base, (reps, 1))[: (deficit - have)])
+
+            left = np.concatenate(left_parts, axis=0)
+            out = np.concatenate([left[-deficit:], out], axis=0)
+
+        # 7) Final guard to exact length
+        if out.shape[0] > ctx_frames:
+            out = out[-ctx_frames:]
+        elif out.shape[0] < ctx_frames:
+            reps = int(np.ceil(ctx_frames / max(1, out.shape[0])))
+            out = np.tile(out, (reps, 1))[-ctx_frames:]
+
+        # 8) Depth guard
         if out.shape[1] != depth:
             out = out[:, :depth]
         return out
+
     
     def _realign_emit_pointer_to_bar(self, sr_model: int):
         """Advance _next_emit_start to the next bar boundary in model-sample space."""
