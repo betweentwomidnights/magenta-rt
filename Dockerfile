@@ -122,6 +122,8 @@ RUN python -m pip install --no-cache-dir --force-reinstall \
     "tensorflow-text-nightly==2.20.0.dev20250316" \
     "tf-hub-nightly"
 
+RUN python -m pip install "jaxlib==0.6.2"
+
 RUN python -m pip install huggingface_hub
 
 RUN python -m pip install --no-cache-dir --force-reinstall "protobuf==4.25.3"
