@@ -50,6 +50,9 @@ class JamWorker(threading.Thread):
         self.outbox: list[JamChunk] = []
         self._stop_event = threading.Event()
 
+        self._stream = None
+        self._next_emit_start = 0
+
         # NEW: Track delivery state
         self._last_delivered_index = 0
         self._max_buffer_ahead = 5
@@ -350,139 +353,127 @@ class JamWorker(threading.Thread):
             self._pending_drop_intro_bars = getattr(self, "_pending_drop_intro_bars", 0) + 1
 
     def run(self):
-        """Main worker loop - generate chunks continuously but don't get too far ahead"""
-        spb = self._seconds_per_bar()
+        """Main worker loop — generate into a continuous stream, then emit bar-aligned slices."""
+        spb = self._seconds_per_bar()                     # seconds per bar
         chunk_secs = self.params.bars_per_chunk * spb
-        xfade = float(self.mrt.config.crossfade_length)  # seconds
+        xfade = float(self.mrt.config.crossfade_length)   # seconds
+        sr = int(self.mrt.sample_rate)
+        chunk_samps = int(round(chunk_secs * sr))
+
+        def _need(first_chunk_extra=False):
+            """How many more samples we still need in the stream to emit next slice."""
+            have = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0] - getattr(self, "_next_emit_start", 0)
+            want = chunk_samps
+            if first_chunk_extra:
+                # reserve two bars extra so first-chunk onset alignment has material
+                want += int(round(2 * spb * sr))
+            return max(0, want - have)
 
         def _mono_env(x: np.ndarray, sr: int, win_ms: float = 10.0) -> np.ndarray:
-            """Rectified moving-average envelope, then a simple onset-y novelty (half-wave diff)."""
-            if x.ndim == 2:
-                x = x.mean(axis=1)
+            if x.ndim == 2: x = x.mean(axis=1)
             x = np.abs(x).astype(np.float32)
             w = max(1, int(round(win_ms * 1e-3 * sr)))
             if w > 1:
                 kern = np.ones(w, dtype=np.float32) / float(w)
                 x = np.convolve(x, kern, mode="same")
-            # onset-ish novelty: positive first difference (half-wave)
             d = np.diff(x, prepend=x[:1])
             d[d < 0] = 0.0
             return d
 
-        def _estimate_first_offset_samples(ref_loop_wav, gen_wav, sr: int, spb: float, max_ms: int = 180) -> int:
-            """
-            Estimate how late/early the first downbeat is by correlating
-            the last bar of the reference vs the first two bars of the generated chunk.
-            Allows small +/- offsets; upsample envelopes x4 for sub-sample precision then round.
-            """
+        def _estimate_first_offset_samples(ref_loop_wav, gen_head_wav, sr: int, spb: float) -> int:
+            """Tempo-aware first-downbeat offset (positive => model late)."""
             try:
+                max_ms = int(max(160.0, min(0.25 * spb * 1000.0, 450.0)))
                 ref = ref_loop_wav if ref_loop_wav.sample_rate == sr else ref_loop_wav.resample(sr)
                 n_bar = int(round(spb * sr))
-
                 ref_tail = ref.samples[-n_bar:, :] if ref.samples.shape[0] >= n_bar else ref.samples
-                gen_head = gen_wav.samples[: int(2 * n_bar), :]
+                gen_head = gen_head_wav.samples[: int(2 * n_bar), :]
                 if ref_tail.size == 0 or gen_head.size == 0:
                     return 0
 
-                e_ref = _mono_env(ref_tail, sr)     # length ~ n_bar
-                e_gen = _mono_env(gen_head, sr)     # length ~ 2*n_bar
-
-                # z-score for scale invariance
+                # envelopes + z-score
+                import numpy as np
                 def _z(a):
-                    m, s = float(a.mean()), float(a.std() or 1.0)
-                    return (a - m) / s
-                e_ref = _z(e_ref).astype(np.float32)
-                e_gen = _z(e_gen).astype(np.float32)
+                    m, s = float(a.mean()), float(a.std() or 1.0); return (a - m) / s
+                e_ref = _z(_mono_env(ref_tail, sr)).astype(np.float32)
+                e_gen = _z(_mono_env(gen_head, sr)).astype(np.float32)
 
-                # Light upsampling for finer lag resolution (x4)
+                # upsample x4 for finer lag
                 def _upsample(a, r=4):
-                    n = len(a)
-                    grid = np.arange(n, dtype=np.float32)
+                    n = len(a); grid = np.arange(n, dtype=np.float32)
                     fine = np.linspace(0, n - 1, num=n * r, dtype=np.float32)
                     return np.interp(fine, grid, a).astype(np.float32)
                 up = 4
-                e_ref_u = _upsample(e_ref, up)
-                e_gen_u = _upsample(e_gen, up)
+                e_ref_u, e_gen_u = _upsample(e_ref, up), _upsample(e_gen, up)
 
-                # Correlate in a tight window
                 max_lag_u = int(round((max_ms / 1000.0) * sr * up))
                 seg = min(len(e_ref_u), len(e_gen_u))
                 e_ref_u = e_ref_u[-seg:]
-                # pad head so we can slide +/- lags
                 pad = np.zeros(max_lag_u, dtype=np.float32)
                 e_gen_u_pad = np.concatenate([pad, e_gen_u, pad])
 
                 best_lag_u, best_score = 0, -1e9
-                # allow tiny early OR late (negative = model early, positive = late)
                 for lag_u in range(-max_lag_u, max_lag_u + 1):
                     start = max_lag_u + lag_u
                     b = e_gen_u_pad[start : start + seg]
-                    # normalized dot (already z-scored, but keep it consistent)
                     denom = (np.linalg.norm(e_ref_u) * np.linalg.norm(b)) or 1.0
                     score = float(np.dot(e_ref_u, b) / denom)
                     if score > best_score:
                         best_score, best_lag_u = score, lag_u
-
-                # convert envelope-lag back to audio samples and round
-                lag_samples = int(round(best_lag_u / up))
-                return lag_samples
+                return int(round(best_lag_u / up))
             except Exception:
                 return 0
 
-        print("🚀 JamWorker started with flow control...")
+        print("🚀 JamWorker started (bar-aligned streaming)…")
 
         while not self._stop_event.is_set():
-            # Don’t get too far ahead of the consumer
             if not self._should_generate_next_chunk():
-                print("⏸️  Buffer full, waiting for consumption...")
-                time.sleep(0.5)
+                time.sleep(0.25)
                 continue
 
-            # Snapshot knobs + compute index
-            with self._lock:
-                style_vec = self.params.style_vec
-                self.mrt.guidance_weight = float(self.params.guidance_weight)
-                self.mrt.temperature     = float(self.params.temperature)
-                self.mrt.topk            = int(self.params.topk)
-                next_idx = self.idx + 1
-
-            print(f"🎹 Generating chunk {next_idx}...")
-            self.last_chunk_started_at = time.time()
-
-            # ---- Generate enough model sub-chunks to yield *audible* chunk_secs ----
-            # First sub-chunk contributes full L; subsequent contribute (L - xfade)
-            assembled = 0.0
-            chunks = []
-            while assembled < chunk_secs and not self._stop_event.is_set():
+            # 1) Generate until we have enough material in the stream
+            need = _need(first_chunk_extra=(self.idx == 0))
+            while need > 0 and not self._stop_event.is_set():
+                with self._lock:
+                    style_vec = self.params.style_vec
+                    self.mrt.guidance_weight = float(self.params.guidance_weight)
+                    self.mrt.temperature     = float(self.params.temperature)
+                    self.mrt.topk            = int(self.params.topk)
                 wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
-                chunks.append(wav)
-                L = wav.samples.shape[0] / float(self.mrt.sample_rate)
-                assembled += L if len(chunks) == 1 else max(0.0, L - xfade)
+                self._append_model_chunk_to_stream(wav)   # equal-power xfade into a persistent stream
+                need = _need(first_chunk_extra=(self.idx == 0))
 
             if self._stop_event.is_set():
                 break
 
-            # ---- Stitch (utils drops the very first model pre-roll) & trim at model SR ----
-            y = stitch_generated(chunks, self.mrt.sample_rate, xfade).as_stereo()
-            y = hard_trim_seconds(y, chunk_secs)
+            # 2) One-time: align the emit pointer to the groove
+            if self.idx == 0 and self.params.combined_loop is not None:
+                # Compare ref tail vs the head of what we're about to emit
+                head_len = min(self._stream.shape[0] - self._next_emit_start, int(round(2 * spb * sr)))
+                seg = self._stream[self._next_emit_start : self._next_emit_start + head_len]
+                gen_head = au.Waveform(seg.astype(np.float32, copy=False), sr).as_stereo()
+                offs = _estimate_first_offset_samples(self.params.combined_loop, gen_head, sr, spb)
+                if offs != 0:
+                    # positive => model late: skip some samples; negative => model early: "rewind" by padding
+                    self._next_emit_start = max(0, self._next_emit_start + offs)
+                    print(f"🎯 First-chunk offset compensation: {offs/sr:+.3f}s")
+                # snap to next bar boundary
+                self._realign_emit_pointer_to_bar(sr)
 
-            # ---- ONE-TIME: grid-align the very first jam chunk to kill the flam ----
-            if next_idx == 1 and self.params.combined_loop is not None:
-                offset = _estimate_first_offset_samples(
-                    self.params.combined_loop, y, int(self.mrt.sample_rate), spb, max_ms=180  # try 160–200
-                )
-                if offset != 0:
-                    # positive => model late: trim head; negative => model early: pad head (rare)
-                    if offset > 0:
-                        y.samples = y.samples[offset:, :]
-                    else:
-                        pad = np.zeros((abs(offset), y.samples.shape[1]), dtype=y.samples.dtype)
-                        y.samples = np.concatenate([pad, y.samples], axis=0)
-                    print(f"🎯 First-chunk offset compensation: {offset/self.mrt.sample_rate:+.3f}s")
-                y = hard_trim_seconds(y, chunk_secs)
+            # 3) Emit exactly bars_per_chunk × spb from the stream
+            start = self._next_emit_start
+            end = start + chunk_samps
+            if end > self._stream.shape[0]:
+                # shouldn't happen often; generate a bit more and loop
+                continue
 
-            # ---- Post-processing ----
-            if next_idx == 1 and self.params.ref_loop is not None:
+            slice_ = self._stream[start:end]
+            self._next_emit_start = end
+
+            y = au.Waveform(slice_.astype(np.float32, copy=False), sr).as_stereo()
+
+            # 4) Post-processing / loudness
+            if self.idx == 0 and self.params.ref_loop is not None:
                 y, _ = match_loudness_to_reference(
                     self.params.ref_loop, y,
                     method=self.params.loudness_mode,
@@ -491,25 +482,21 @@ class JamWorker(threading.Thread):
             else:
                 apply_micro_fades(y, 3)
 
-            # ---- Resample + bar-snap + encode ----
+            # 5) Resample + exact-length snap + encode
             b64, meta = self._snap_and_encode(
-                y,
-                seconds=chunk_secs,
-                target_sr=self.params.target_sr,
-                bars=self.params.bars_per_chunk
+                y, seconds=chunk_secs, target_sr=self.params.target_sr, bars=self.params.bars_per_chunk
             )
-            meta["xfade_seconds"] = xfade  # tiny hint for client if you want butter at chunk joins
+            meta["xfade_seconds"] = xfade
 
-            # ---- Publish ----
+            # 6) Publish
             with self._lock:
-                self.idx = next_idx
-                self.outbox.append(JamChunk(index=next_idx, audio_base64=b64, metadata=meta))
+                self.idx += 1
+                self.outbox.append(JamChunk(index=self.idx, audio_base64=b64, metadata=meta))
                 if len(self.outbox) > 10:
                     cutoff = self._last_delivered_index - 5
                     self.outbox = [ch for ch in self.outbox if ch.index > cutoff]
 
-            self.last_chunk_completed_at = time.time()
-            print(f"✅ Completed chunk {next_idx}")
+            print(f"✅ Completed chunk {self.idx}")
 
         print("🛑 JamWorker stopped")
 
