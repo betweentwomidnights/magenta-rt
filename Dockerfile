@@ -130,8 +130,6 @@ RUN python -m pip install gradio
 
 RUN python -m pip install soxr
 
-RUN python -m pip install samplerate
-
 # Switch to Spaces’ preferred user
 # Switch to Spaces’ preferred user
 RUN useradd -m -u 1000 appuser
