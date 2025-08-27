@@ -128,7 +128,9 @@ RUN python -m pip install --no-cache-dir --force-reinstall "protobuf==4.25.3"
 
 RUN python -m pip install gradio
 
+RUN python -m pip install soxr
 
+RUN python -m pip install samplerate
 
 # Switch to Spaces’ preferred user
 # Switch to Spaces’ preferred user

@@ -308,7 +308,7 @@ def generate_loop_continuation_with_mrt(
 
     # Bar-aligned token window (unchanged)
     context_tokens = make_bar_aligned_context(
-        tokens, bpm=bpm, fps=int(mrt.codec.frame_rate),
+        tokens, bpm=bpm, fps=float(mrt.codec.frame_rate),
         ctx_frames=mrt.config.context_length_frames, beats_per_bar=beats_per_bar
     )
     state = mrt.init_state()
@@ -441,7 +441,7 @@ def _mrt_warmup():
                 context_tokens = make_bar_aligned_context(
                     tokens,
                     bpm=bpm,
-                    fps=int(mrt.codec.frame_rate),
+                    fps=float(mrt.codec.frame_rate),
                     ctx_frames=mrt.config.context_length_frames,
                     beats_per_bar=beats_per_bar,
                 )

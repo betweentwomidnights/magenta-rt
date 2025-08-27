@@ -10,6 +10,7 @@ from utils import (
     apply_micro_fades, make_bar_aligned_context, take_bar_aligned_tail,
     resample_and_snap, wav_bytes_base64
 )
+from math import floor, ceil
 
 @dataclass
 class JamParams:
@@ -60,6 +61,10 @@ class JamWorker(threading.Thread):
         # Timing info
         self.last_chunk_started_at = None
         self.last_chunk_completed_at = None
+
+        self._pending_reseed = None        # {"ctx": np.ndarray, "ref": au.Waveform|None}
+        self._needs_bar_realign = False    # request a one-shot downbeat alignment
+        self._reseed_ref_loop = None       # which loop to align against after reseed
 
 
     def _setup_context_from_combined_loop(self):
@@ -382,18 +387,17 @@ class JamWorker(threading.Thread):
 
     def reseed_splice(self, recent_wav, anchor_bars: float):
         """
-        Token-splice reseed:
-        - original = the context we captured when the jam started
-        - recent   = tokens from the provided recent waveform (usually Swift-combined mix)
-        - anchor_bars controls how much of the original vibe we re-inject
+        Token-splice reseed queued for the next bar boundary between chunks.
         """
         with self._lock:
             if not hasattr(self, "_original_context_tokens") or self._original_context_tokens is None:
-                # Fallback: if we somehow don’t have originals, treat current as originals
                 self._original_context_tokens = np.copy(self.state.context_tokens)
 
-            recent_tokens = self._make_recent_tokens_from_wave(recent_wav)          # [T, depth]
+            recent_tokens = self._make_recent_tokens_from_wave(recent_wav)  # [T, depth]
             new_ctx = self._splice_context(self._original_context_tokens, recent_tokens, anchor_bars)
+
+            # Queue it; the run loop will install right after we finish the current slice
+            self._pending_reseed = {"ctx": new_ctx, "ref": recent_wav}
 
             # install the new context window
             new_state = self.mrt.init_state()
@@ -411,15 +415,31 @@ class JamWorker(threading.Thread):
         chunk_secs = self.params.bars_per_chunk * spb
         xfade = float(self.mrt.config.crossfade_length)   # seconds
         sr = int(self.mrt.sample_rate)
-        chunk_samps = int(round(chunk_secs * sr))
+        chunk_step_f = chunk_secs * sr    # float samples per chunk
+        self._emit_phase = getattr(self, "_emit_phase", 0.0)
 
-        def _need(first_chunk_extra=False):
-            """How many more samples we still need in the stream to emit next slice."""
-            have = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0] - getattr(self, "_next_emit_start", 0)
-            want = chunk_samps
+        def _need(first_chunk_extra: bool = False) -> int:
+            """
+            How many more samples we still need in the stream to emit the next slice.
+            Uses the fractional step (chunk_step_f) + current _emit_phase to compute
+            the *integer* number of samples required for the next chunk, without
+            mutating _emit_phase here.
+            """
+            start = getattr(self, "_next_emit_start", 0)
+            total = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0]
+            have = max(0, total - start)
+
+            # Compute the integer step we'd use for the next emit, non-mutating.
+            emit_phase = float(getattr(self, "_emit_phase", 0.0))
+            step_int = int(floor(chunk_step_f + emit_phase))  # matches the logic used when advancing
+
+            # How much we want available beyond 'start' for this emit.
+            want = step_int
             if first_chunk_extra:
-                # reserve two bars extra so first-chunk onset alignment has material
-                want += int(round(2 * spb * sr))
+                # Reserve two extra bars so the first-chunk onset alignment has material.
+                # Use ceil to be conservative so we don't under-request.
+                want += int(ceil(2.0 * spb * sr))
+
             return max(0, want - have)
 
         def _mono_env(x: np.ndarray, sr: int, win_ms: float = 10.0) -> np.ndarray:
@@ -445,7 +465,6 @@ class JamWorker(threading.Thread):
                     return 0
 
                 # envelopes + z-score
-                import numpy as np
                 def _z(a):
                     m, s = float(a.mean()), float(a.std() or 1.0); return (a - m) / s
                 e_ref = _z(_mono_env(ref_tail, sr)).astype(np.float32)
@@ -500,22 +519,26 @@ class JamWorker(threading.Thread):
                 break
 
             # 2) One-time: align the emit pointer to the groove
-            if self.idx == 0 and self.params.combined_loop is not None:
-                # Compare ref tail vs the head of what we're about to emit
-                head_len = min(self._stream.shape[0] - self._next_emit_start, int(round(2 * spb * sr)))
-                seg = self._stream[self._next_emit_start : self._next_emit_start + head_len]
-                gen_head = au.Waveform(seg.astype(np.float32, copy=False), sr).as_stereo()
-                offs = _estimate_first_offset_samples(self.params.combined_loop, gen_head, sr, spb)
-                if offs != 0:
-                    # positive => model late: skip some samples; negative => model early: "rewind" by padding
-                    self._next_emit_start = max(0, self._next_emit_start + offs)
-                    print(f"🎯 First-chunk offset compensation: {offs/sr:+.3f}s")
-                # snap to next bar boundary
-                self._realign_emit_pointer_to_bar(sr)
+            if (self.idx == 0 and self.params.combined_loop is not None) or self._needs_bar_realign:
+                ref_loop = self._reseed_ref_loop or self.params.combined_loop
+                if ref_loop is not None:
+                    head_len = min(self._stream.shape[0] - self._next_emit_start, int(round(2 * spb * sr)))
+                    seg = self._stream[self._next_emit_start : self._next_emit_start + head_len]
+                    gen_head = au.Waveform(seg.astype(np.float32, copy=False), sr).as_stereo()
+                    offs = _estimate_first_offset_samples(ref_loop, gen_head, sr, spb)
+                    if offs != 0:
+                        self._next_emit_start = max(0, self._next_emit_start + offs)
+                        print(f"🎯 Offset compensation: {offs/sr:+.3f}s")
+                    self._realign_emit_pointer_to_bar(sr)
+                self._needs_bar_realign = False
+                self._reseed_ref_loop = None
 
             # 3) Emit exactly bars_per_chunk × spb from the stream
             start = self._next_emit_start
-            end = start + chunk_samps
+            step_total = chunk_step_f + self._emit_phase
+            step_int   = int(np.floor(step_total))
+            self._emit_phase = float(step_total - step_int)
+            end = start + step_int
             if end > self._stream.shape[0]:
                 # shouldn't happen often; generate a bit more and loop
                 continue
@@ -548,6 +571,23 @@ class JamWorker(threading.Thread):
                 if len(self.outbox) > 10:
                     cutoff = self._last_delivered_index - 5
                     self.outbox = [ch for ch in self.outbox if ch.index > cutoff]
+
+                # 👉 If a reseed was requested, apply it *now*, between chunks
+                if self._pending_reseed is not None:
+                    pkg = self._pending_reseed
+                    self._pending_reseed = None
+
+                    new_state = self.mrt.init_state()
+                    new_state.context_tokens = pkg["ctx"]          # exact (ctx_frames, depth)
+                    self.state = new_state
+
+                    # start a fresh stream and schedule one-time alignment
+                    self._stream = None
+                    self._next_emit_start = 0
+                    self._reseed_ref_loop = pkg.get("ref") or self.params.combined_loop
+                    self._needs_bar_realign = True
+
+                    print("🔁 Reseed installed at bar boundary; will realign before next slice")
 
             print(f"✅ Completed chunk {self.idx}")
 
