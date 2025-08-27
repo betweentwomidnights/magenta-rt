@@ -10,7 +10,6 @@ from utils import (
     apply_micro_fades, make_bar_aligned_context, take_bar_aligned_tail,
     resample_and_snap, wav_bytes_base64
 )
-from math import floor, ceil
 
 @dataclass
 class JamParams:
@@ -415,31 +414,15 @@ class JamWorker(threading.Thread):
         chunk_secs = self.params.bars_per_chunk * spb
         xfade = float(self.mrt.config.crossfade_length)   # seconds
         sr = int(self.mrt.sample_rate)
-        chunk_step_f = chunk_secs * sr    # float samples per chunk
-        self._emit_phase = getattr(self, "_emit_phase", 0.0)
+        chunk_samps = int(round(chunk_secs * sr))
 
-        def _need(first_chunk_extra: bool = False) -> int:
-            """
-            How many more samples we still need in the stream to emit the next slice.
-            Uses the fractional step (chunk_step_f) + current _emit_phase to compute
-            the *integer* number of samples required for the next chunk, without
-            mutating _emit_phase here.
-            """
-            start = getattr(self, "_next_emit_start", 0)
-            total = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0]
-            have = max(0, total - start)
-
-            # Compute the integer step we'd use for the next emit, non-mutating.
-            emit_phase = float(getattr(self, "_emit_phase", 0.0))
-            step_int = int(floor(chunk_step_f + emit_phase))  # matches the logic used when advancing
-
-            # How much we want available beyond 'start' for this emit.
-            want = step_int
+        def _need(first_chunk_extra=False):
+            """How many more samples we still need in the stream to emit next slice."""
+            have = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0] - getattr(self, "_next_emit_start", 0)
+            want = chunk_samps
             if first_chunk_extra:
-                # Reserve two extra bars so the first-chunk onset alignment has material.
-                # Use ceil to be conservative so we don't under-request.
-                want += int(ceil(2.0 * spb * sr))
-
+                # reserve two bars extra so first-chunk onset alignment has material
+                want += int(round(2 * spb * sr))
             return max(0, want - have)
 
         def _mono_env(x: np.ndarray, sr: int, win_ms: float = 10.0) -> np.ndarray:
@@ -465,6 +448,7 @@ class JamWorker(threading.Thread):
                     return 0
 
                 # envelopes + z-score
+                import numpy as np
                 def _z(a):
                     m, s = float(a.mean()), float(a.std() or 1.0); return (a - m) / s
                 e_ref = _z(_mono_env(ref_tail, sr)).astype(np.float32)
@@ -535,10 +519,7 @@ class JamWorker(threading.Thread):
 
             # 3) Emit exactly bars_per_chunk × spb from the stream
             start = self._next_emit_start
-            step_total = chunk_step_f + self._emit_phase
-            step_int   = int(np.floor(step_total))
-            self._emit_phase = float(step_total - step_int)
-            end = start + step_int
+            end = start + chunk_samps
             if end > self._stream.shape[0]:
                 # shouldn't happen often; generate a bit more and loop
                 continue
