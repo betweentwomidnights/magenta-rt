@@ -237,3 +237,93 @@ def wav_bytes_base64(x: np.ndarray, sr: int) -> tuple[str, int, int]:
     buf.seek(0)
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     return b64, int(x.shape[0]), int(x.shape[1])
+
+def _ratio(out_sr: int, in_sr: int) -> tuple[int, int]:
+    g = gcd(int(out_sr), int(in_sr))
+    return int(out_sr) // g, int(in_sr) // g
+
+class StreamingResampler:
+    """
+    Stateful streaming resampler.
+    Prefers soxr (best), then libsamplerate; final fallback is block resample_poly.
+    Always pass float32 arrays shaped (S, C).
+    """
+    def __init__(self, in_sr: int, out_sr: int, channels: int = 2, quality: str = "VHQ"):
+        self.in_sr = int(in_sr)
+        self.out_sr = int(out_sr)
+        self.channels = int(channels)
+        self.quality = quality
+        self._backend = None
+
+        # Try soxr first
+        try:
+            import soxr  # pip install soxr
+            self._backend = "soxr"
+            # dtype float32 keeps things consistent with the rest of your code
+            self._rs = soxr.Resampler(
+                self.in_sr,
+                self.out_sr,
+                channels=self.channels,
+                dtype="float32",
+                quality=self.quality,  # "Q", "HQ", "VHQ"
+            )
+        except Exception:
+            # Try libsamplerate
+            try:
+                import samplerate  # pip install samplerate
+                self._backend = "samplerate"
+                # sinc_best == highest quality; you can choose 'sinc_medium' for speed
+                self._rs = samplerate.Resampler(converter_type="sinc_best", channels=self.channels)
+            except Exception:
+                # Last resort: block resample (not truly streaming)
+                from scipy.signal import resample_poly
+                self._backend = "scipy"
+                self._resample_poly = resample_poly
+                self._L, self._M = _ratio(self.out_sr, self.in_sr)
+                # Keep a tiny tail to help transitions (still not perfect vs true streaming)
+                self._hist = np.zeros((0, self.channels), dtype=np.float32)
+
+    def process(self, x: np.ndarray, final: bool = False) -> np.ndarray:
+        """Feed a chunk (S, C) and get resampled chunk (S', C). Keep calling in order."""
+        if x.size == 0 and not final:
+            # nothing to do
+            return np.zeros((0, self.channels), dtype=np.float32)
+
+        if self._backend == "soxr":
+            return self._rs.process(x, final=final)
+
+        elif self._backend == "samplerate":
+            import samplerate
+            ratio = float(self.out_sr) / float(self.in_sr)
+            # end_of_input=True flushes tail on the last call
+            y = self._rs.process(x, ratio, end_of_input=final)
+            # libsamplerate returns (S', C)
+            return y.astype(np.float32, copy=False)
+
+        # --- scipy fallback (block, not truly streaming) ---
+        # We concatenate a short history to reduce block edge artifacts
+        x_ext = x if self._hist.size == 0 else np.vstack([self._hist, x])
+        y = self._resample_poly(x_ext, up=self._L, down=self._M, axis=0).astype(np.float32, copy=False)
+
+        # Heuristic: drop the portion corresponding roughly to the history to avoid duplicate content
+        # (Not perfect, but helps a lot when chunks are reasonably sized.)
+        drop = int(round(self._hist.shape[0] * self.out_sr / self.in_sr))
+        y = y[drop:] if drop < y.shape[0] else np.zeros((0, self.channels), dtype=np.float32)
+
+        # Keep a small input tail for the next call (say ~ 4 ms at in_sr)
+        tail_samples = max(int(0.004 * self.in_sr), 1)
+        self._hist = x[-tail_samples:] if x.shape[0] >= tail_samples else x.copy()
+        if final:
+            self._hist = np.zeros((0, self.channels), dtype=np.float32)
+        return y
+
+    def flush(self) -> np.ndarray:
+        """Drain converter tail (call at stop)."""
+        if self._backend == "soxr":
+            return self._rs.process(np.zeros((0, self.channels), dtype=np.float32), final=True)
+        elif self._backend == "samplerate":
+            ratio = float(self.out_sr) / float(self.in_sr)
+            return self._rs.process(np.zeros((0, self.channels), dtype=np.float32), ratio, end_of_input=True)
+        else:
+            # nothing meaningful to flush in scipy fallback
+            return np.zeros((0, self.channels), dtype=np.float32)
