@@ -109,81 +109,55 @@ def apply_micro_fades(wav: au.Waveform, ms: int = 5) -> None:
 
 
 # ---------- Token context helpers ----------
-def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_bar=4, precise_timing=False):
+def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_bar=4):
     """
     Return a ctx_frames-long slice of `tokens` whose **end** lands on the nearest
-    whole-bar boundary in codec-frame space.
-    
-    NEW: precise_timing mode handles fractional frames per bar more carefully.
+    whole-bar boundary in codec-frame space, even when frames_per_bar is fractional.
+
+    tokens: np.ndarray of shape (T, D) or (T,) where T = codec frames
+    bpm: float
+    fps: float (codec frames per second; keep this as float)
+    ctx_frames: int (length of context window in codec frames)
+    beats_per_bar: int
     """
+ 
+
     if tokens is None:
         raise ValueError("tokens is None")
     tokens = np.asarray(tokens)
     if tokens.ndim == 1:
-        tokens = tokens[:, None]
+        tokens = tokens[:, None]  # promote to (T, 1) for uniform tiling
 
     T = tokens.shape[0]
     if T == 0:
         return tokens
 
     fps = float(fps)
-    frames_per_bar_f = (beats_per_bar * 60.0 / float(bpm)) * fps
+    frames_per_bar_f = (beats_per_bar * 60.0 / float(bpm)) * fps  # float frames per bar
 
-    if precise_timing and abs(frames_per_bar_f - round(frames_per_bar_f)) > 1e-6:
-        # We have fractional frames per bar - use a different strategy
-        # Instead of trying to align to exact bar boundaries, align to the closest
-        # multiple of frames_per_bar_f that gives us integer frame positions
-        
-        # Tile enough to work with
-        reps = max(2, int(np.ceil((ctx_frames + T) / float(T))))
-        tiled = np.tile(tokens, (reps, 1))
-        total = tiled.shape[0]
-        
-        # Find the best integer end position that's close to a bar boundary
-        best_end = ctx_frames
-        best_error = float('inf')
-        
-        # Check positions around the naive ctx_frames endpoint
-        for candidate_end in range(max(ctx_frames - 50, ctx_frames), min(total, ctx_frames + 50)):
-            # How many fractional bars does this represent?
-            fractional_bars = candidate_end / frames_per_bar_f
-            # How far from an integer number of bars?
-            bar_error = abs(fractional_bars - round(fractional_bars))
-            
-            if bar_error < best_error:
-                best_error = bar_error
-                best_end = candidate_end
-        
-        end_idx = best_end
-        start_idx = max(0, end_idx - ctx_frames)
-        
-        window = tiled[start_idx:end_idx]
-        
-        # Report timing info for debugging
-        actual_bars = end_idx / frames_per_bar_f
-        print(f"Context aligned to {actual_bars:.3f} bars (error: {best_error:.4f})")
-        
-    else:
-        # Original logic for integer frames per bar
-        reps = int(np.ceil((ctx_frames + T) / float(T))) + 1
-        tiled = np.tile(tokens, (reps, 1))
-        total = tiled.shape[0]
+    # Tile a little more than we need so we can always snap the END to a bar boundary
+    reps = int(np.ceil((ctx_frames + T) / float(T))) + 1
+    tiled = np.tile(tokens, (reps, 1))
+    total = tiled.shape[0]
 
-        k_bars = int(np.floor(total / frames_per_bar_f))
-        if k_bars <= 0:
-            window = tiled[-ctx_frames:]
-            return window
+    # How many whole bars fit?
+    k_bars = int(np.floor(total / frames_per_bar_f))
+    if k_bars <= 0:
+        # Fallback: just take the last ctx_frames
+        window = tiled[-ctx_frames:]
+        return window
 
-        end_idx = int(round(k_bars * frames_per_bar_f))
-        end_idx = min(max(end_idx, ctx_frames), total)
-        start_idx = end_idx - ctx_frames
-        if start_idx < 0:
-            start_idx = 0
-            end_idx = ctx_frames
+    # Snap END index to the nearest integer frame at a whole-bar boundary
+    end_idx = int(round(k_bars * frames_per_bar_f))
+    end_idx = min(max(end_idx, ctx_frames), total)
+    start_idx = end_idx - ctx_frames
+    if start_idx < 0:
+        start_idx = 0
+        end_idx = ctx_frames
 
-        window = tiled[start_idx:end_idx]
+    window = tiled[start_idx:end_idx]
 
-    # Ensure exact length
+    # Guard against rare off-by-one due to rounding
     if window.shape[0] < ctx_frames:
         pad = np.tile(tokens, (int(np.ceil((ctx_frames - window.shape[0]) / T)), 1))
         window = np.vstack([window, pad])[:ctx_frames]
