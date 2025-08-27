@@ -410,186 +410,196 @@ class JamWorker(threading.Thread):
             self._pending_drop_intro_bars = getattr(self, "_pending_drop_intro_bars", 0) + 1
 
     def run(self):
-        """Main worker loop — generate into a continuous stream, then emit bar-aligned slices."""
-        spb = self._seconds_per_bar()                     # seconds per bar
-        chunk_secs = self.params.bars_per_chunk * spb
-        xfade = float(self.mrt.config.crossfade_length)   # seconds
-        sr = int(self.mrt.sample_rate)
-        chunk_step_f = chunk_secs * sr    # float samples per chunk
-        self._emit_phase = getattr(self, "_emit_phase", 0.0)
+        """Main worker loop — continuous gen at model SR, stream resampled chunks butt-joined at target SR."""
+        import numpy as _np
+        from math import floor, ceil
+        spb = self._seconds_per_bar()                           # seconds per bar
+        chunk_secs = float(self.params.bars_per_chunk) * spb    # seconds per client chunk
+        xfade_s   = float(self.mrt.config.crossfade_length)     # seconds of model equal-power xfade
+        sr_in     = int(self.mrt.sample_rate)                   # model/native SR
+        sr_out    = int(self.params.target_sr or sr_in)         # desired output SR (e.g., 44100)
+        ch        = 2                                           # enforce stereo out
 
-        def _need(first_chunk_extra: bool = False) -> int:
-            """
-            How many more samples we still need in the stream to emit the next slice.
-            Uses the fractional step (chunk_step_f) + current _emit_phase to compute
-            the *integer* number of samples required for the next chunk, without
-            mutating _emit_phase here.
-            """
-            start = getattr(self, "_next_emit_start", 0)
-            total = 0 if getattr(self, "_stream", None) is None else self._stream.shape[0]
-            have = max(0, total - start)
+        # --- Fractional emit steppers (input + output domains) ---
+        chunk_step_in_f  = chunk_secs * sr_in
+        self._emit_phase = float(getattr(self, "_emit_phase", 0.0))
 
-            # Compute the integer step we'd use for the next emit, non-mutating.
+        chunk_step_out_f    = chunk_secs * sr_out
+        self._emit_phase_out = float(getattr(self, "_emit_phase_out", 0.0))
+        self._next_emit_start_out = int(getattr(self, "_next_emit_start_out", 0))
+
+        # --- Streaming resampler state (input -> output); hold back xfade tail so overlapped region is final ---
+        xfade_n_in  = int(round(xfade_s * sr_in))
+        self._resampler = None
+        self._stream_out = None
+        self._resample_cursor_in = int(getattr(self, "_resample_cursor_in", 0))  # how many INPUT samples we fed to the resampler
+
+        if sr_out != sr_in:
+            try:
+                from utils import StreamingResampler
+                self._resampler = StreamingResampler(in_sr=sr_in, out_sr=sr_out, channels=ch, quality="VHQ")
+                self._stream_out = _np.zeros((0, ch), dtype=_np.float32)
+            except Exception as e:
+                print(f"⚠️  Could not init StreamingResampler ({e}); falling back to alias-mode (sr_out==sr_in).")
+                sr_out = sr_in
+                self.params.target_sr = sr_out
+                self._resampler = None
+                self._stream_out = _np.zeros((0, ch), dtype=_np.float32)
+                self._resample_cursor_in = 0
+        else:
+            self._stream_out = _np.zeros((0, ch), dtype=_np.float32)
+            self._resample_cursor_in = 0
+
+        # --- helper: how many more INPUT samples (stable) we need to be able to emit next client chunk ---
+        def _need(first_chunk_extra: bool=False) -> int:
+            start = int(getattr(self, "_next_emit_start", 0))
+            total_in = 0 if getattr(self, "_stream", None) is None else int(self._stream.shape[0])
+            total_in_stable = max(0, total_in - xfade_n_in)     # hold back xfade tail (overlap will be replaced)
+            have = max(0, total_in_stable - start)
             emit_phase = float(getattr(self, "_emit_phase", 0.0))
-            step_int = int(floor(chunk_step_f + emit_phase))  # matches the logic used when advancing
-
-            # How much we want available beyond 'start' for this emit.
-            want = step_int
+            step_int_in = int(floor(chunk_step_in_f + emit_phase))
+            want = step_int_in
             if first_chunk_extra:
-                # Reserve two extra bars so the first-chunk onset alignment has material.
-                # Use ceil to be conservative so we don't under-request.
-                want += int(ceil(2.0 * spb * sr))
-
+                want += int(ceil(2.0 * spb * sr_in))
             return max(0, want - have)
 
-        def _mono_env(x: np.ndarray, sr: int, win_ms: float = 10.0) -> np.ndarray:
-            if x.ndim == 2: x = x.mean(axis=1)
-            x = np.abs(x).astype(np.float32)
-            w = max(1, int(round(win_ms * 1e-3 * sr)))
-            if w > 1:
-                kern = np.ones(w, dtype=np.float32) / float(w)
-                x = np.convolve(x, kern, mode="same")
-            d = np.diff(x, prepend=x[:1])
-            d[d < 0] = 0.0
-            return d
+        print(f"▶️ JamWorker starting: bpm={self.params.bpm}, bars/chunk={self.params.bars_per_chunk}, "
+            f"sr_in={sr_in}, sr_out={sr_out}, xfade_s={xfade_s:.3f}")
 
-        def _estimate_first_offset_samples(ref_loop_wav, gen_head_wav, sr: int, spb: float) -> int:
-            """Tempo-aware first-downbeat offset (positive => model late)."""
-            try:
-                max_ms = int(max(160.0, min(0.25 * spb * 1000.0, 450.0)))
-                ref = ref_loop_wav if ref_loop_wav.sample_rate == sr else ref_loop_wav.resample(sr)
-                n_bar = int(round(spb * sr))
-                ref_tail = ref.samples[-n_bar:, :] if ref.samples.shape[0] >= n_bar else ref.samples
-                gen_head = gen_head_wav.samples[: int(2 * n_bar), :]
-                if ref_tail.size == 0 or gen_head.size == 0:
-                    return 0
-
-                # envelopes + z-score
-                def _z(a):
-                    m, s = float(a.mean()), float(a.std() or 1.0); return (a - m) / s
-                e_ref = _z(_mono_env(ref_tail, sr)).astype(np.float32)
-                e_gen = _z(_mono_env(gen_head, sr)).astype(np.float32)
-
-                # upsample x4 for finer lag
-                def _upsample(a, r=4):
-                    n = len(a); grid = np.arange(n, dtype=np.float32)
-                    fine = np.linspace(0, n - 1, num=n * r, dtype=np.float32)
-                    return np.interp(fine, grid, a).astype(np.float32)
-                up = 4
-                e_ref_u, e_gen_u = _upsample(e_ref, up), _upsample(e_gen, up)
-
-                max_lag_u = int(round((max_ms / 1000.0) * sr * up))
-                seg = min(len(e_ref_u), len(e_gen_u))
-                e_ref_u = e_ref_u[-seg:]
-                pad = np.zeros(max_lag_u, dtype=np.float32)
-                e_gen_u_pad = np.concatenate([pad, e_gen_u, pad])
-
-                best_lag_u, best_score = 0, -1e9
-                for lag_u in range(-max_lag_u, max_lag_u + 1):
-                    start = max_lag_u + lag_u
-                    b = e_gen_u_pad[start : start + seg]
-                    denom = (np.linalg.norm(e_ref_u) * np.linalg.norm(b)) or 1.0
-                    score = float(np.dot(e_ref_u, b) / denom)
-                    if score > best_score:
-                        best_score, best_lag_u = score, lag_u
-                return int(round(best_lag_u / up))
-            except Exception:
-                return 0
-
-        print("🚀 JamWorker started (bar-aligned streaming)…")
-
+        # --- main loop ---
         while not self._stop_event.is_set():
+            # 0) Backpressure: don't run too far ahead
             if not self._should_generate_next_chunk():
-                time.sleep(0.25)
+                time.sleep(0.01)
                 continue
 
-            # 1) Generate until we have enough material in the stream
+            # 1) Ensure enough model audio exists (INPUT domain)
             need = _need(first_chunk_extra=(self.idx == 0))
-            while need > 0 and not self._stop_event.is_set():
-                with self._lock:
-                    style_vec = self.params.style_vec
-                    self.mrt.guidance_weight = float(self.params.guidance_weight)
-                    self.mrt.temperature     = float(self.params.temperature)
-                    self.mrt.topk            = int(self.params.topk)
+            if need > 0:
+                # Generate one model chunk
+                style_vec = self.params.style_vec
+                self.mrt.guidance_weight = float(self.params.guidance_weight)
+                self.mrt.temperature     = float(self.params.temperature)
+                self.mrt.topk            = int(self.params.topk)
+
                 wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
-                self._append_model_chunk_to_stream(wav)   # equal-power xfade into a persistent stream
-                need = _need(first_chunk_extra=(self.idx == 0))
 
-            if self._stop_event.is_set():
-                break
+                # Append (equal-power crossfade into persistent input-domain stream)
+                self._append_model_chunk_to_stream(wav)
 
-            # 2) One-time: align the emit pointer to the groove
-            if (self.idx == 0 and self.params.combined_loop is not None) or self._needs_bar_realign:
-                ref_loop = self._reseed_ref_loop or self.params.combined_loop
-                if ref_loop is not None:
-                    head_len = min(self._stream.shape[0] - self._next_emit_start, int(round(2 * spb * sr)))
-                    seg = self._stream[self._next_emit_start : self._next_emit_start + head_len]
-                    gen_head = au.Waveform(seg.astype(np.float32, copy=False), sr).as_stereo()
-                    offs = _estimate_first_offset_samples(ref_loop, gen_head, sr, spb)
-                    if offs != 0:
-                        self._next_emit_start = max(0, self._next_emit_start + offs)
-                        print(f"🎯 Offset compensation: {offs/sr:+.3f}s")
-                    self._realign_emit_pointer_to_bar(sr)
+                # Feed *stable* portion into the resampler/output buffer
+                if getattr(self, "_stream", None) is not None and self._stream.shape[0] > 0:
+                    stable_end_in = max(0, int(self._stream.shape[0]) - xfade_n_in)
+                    if stable_end_in > self._resample_cursor_in:
+                        x_in = self._stream[self._resample_cursor_in:stable_end_in]
+                        if self._resampler is not None:
+                            y_out = self._resampler.process(x_in.astype(_np.float32, copy=False), final=False)
+                            if y_out.size:
+                                self._stream_out = y_out if self._stream_out.size == 0 else _np.vstack([self._stream_out, y_out])
+                        else:
+                            # pass-through (sr_out == sr_in)
+                            self._stream_out = x_in if self._stream_out.size == 0 else _np.vstack([self._stream_out, x_in])
+                        self._resample_cursor_in = stable_end_in
+                # loop back to either generate more or try emitting
+                continue
+
+            # 2) Optional, one-shot bar realign (occurs on first slice or reseed)
+            if getattr(self, "_needs_bar_realign", False):
+                self._realign_emit_pointer_to_bar(sr_in)
+                self._emit_phase = 0.0    # restart fractional phase at clean bar
                 self._needs_bar_realign = False
                 self._reseed_ref_loop = None
 
-            # 3) Emit exactly bars_per_chunk × spb from the stream
-            start = self._next_emit_start
-            step_total = chunk_step_f + self._emit_phase
-            step_int   = int(np.floor(step_total))
-            self._emit_phase = float(step_total - step_int)
-            end = start + step_int
-            if end > self._stream.shape[0]:
-                # shouldn't happen often; generate a bit more and loop
+            # 3) Compute next emit window in BOTH domains
+            start_in = int(getattr(self, "_next_emit_start", 0))
+            step_total_in = chunk_step_in_f + self._emit_phase
+            step_int_in   = int(floor(step_total_in))
+            new_phase_in  = float(step_total_in - step_int_in)
+            end_in        = start_in + step_int_in
+
+            start_out = int(self._next_emit_start_out)
+            step_total_out = chunk_step_out_f + self._emit_phase_out
+            step_int_out   = int(floor(step_total_out))
+            new_phase_out  = float(step_total_out - step_int_out)
+            end_out        = start_out + step_int_out
+
+            # 4) Guards — do we actually have enough ready in both domains?
+            total_in_stable = 0
+            if getattr(self, "_stream", None) is not None:
+                total_in_stable = max(0, int(self._stream.shape[0]) - xfade_n_in)
+            total_out_ready = 0 if self._stream_out is None else int(self._stream_out.shape[0])
+
+            if end_in > total_in_stable or end_out > total_out_ready:
+                time.sleep(0.005)
                 continue
 
-            slice_ = self._stream[start:end]
-            self._next_emit_start = end
+            # 5) Slice OUTPUT-domain audio to send
+            slice_out = self._stream_out[start_out:end_out]
 
-            y = au.Waveform(slice_.astype(np.float32, copy=False), sr).as_stereo()
+            # Advance pointers + phases atomically
+            self._next_emit_start      = end_in
+            self._emit_phase           = new_phase_in
+            self._next_emit_start_out  = end_out
+            self._emit_phase_out       = new_phase_out
 
-            # 4) Post-processing / loudness
+            # 6) Post and encode
+            y = au.Waveform(slice_out.astype(_np.float32, copy=False), sr_out).as_stereo()
+
+            # Loudness: only on first chunk, match to ref if provided
             if self.idx == 0 and self.params.ref_loop is not None:
                 y, _ = match_loudness_to_reference(
                     self.params.ref_loop, y,
                     method=self.params.loudness_mode,
                     headroom_db=self.params.headroom_db
                 )
-            else:
-                apply_micro_fades(y, 3)
+            # (No per-slice micro fades; stream continuity handles joins)
 
-            # 5) Resample + exact-length snap + encode
-            b64, meta = self._snap_and_encode(
-                y, seconds=chunk_secs, target_sr=self.params.target_sr, bars=self.params.bars_per_chunk
+            # Encode WAV (already sr_out and exact length by construction)
+            b64, total_samples, channels = wav_bytes_base64(
+                y.samples if y.samples.ndim == 2 else y.samples[:, None], sr_out
             )
-            meta["xfade_seconds"] = xfade
 
-            # 6) Publish
+            meta = {
+                "bpm": int(round(self.params.bpm)),
+                "bars": int(self.params.bars_per_chunk),
+                "beats_per_bar": int(self.params.beats_per_bar),
+                "sample_rate": int(sr_out),
+                "channels": int(channels),
+                "total_samples": int(total_samples),
+                "seconds_per_bar": float(spb),
+                "loop_duration_seconds": float(self.params.bars_per_chunk) * float(spb),
+                "guidance_weight": float(self.params.guidance_weight),
+                "temperature": float(self.params.temperature),
+                "topk": int(self.params.topk),
+                "xfade_seconds": float(xfade_s),
+            }
+
             with self._lock:
                 self.idx += 1
                 self.outbox.append(JamChunk(index=self.idx, audio_base64=b64, metadata=meta))
+                # prune outbox
                 if len(self.outbox) > 10:
                     cutoff = self._last_delivered_index - 5
                     self.outbox = [ch for ch in self.outbox if ch.index > cutoff]
 
-                # 👉 If a reseed was requested, apply it *now*, between chunks
-                if self._pending_reseed is not None:
+                # Apply any pending reseed *between* chunks
+                if getattr(self, "_pending_reseed", None) is not None:
                     pkg = self._pending_reseed
                     self._pending_reseed = None
-
-                    new_state = self.mrt.init_state()
-                    new_state.context_tokens = pkg["ctx"]          # exact (ctx_frames, depth)
-                    self.state = new_state
-
-                    # start a fresh stream and schedule one-time alignment
-                    self._stream = None
-                    self._next_emit_start = 0
-                    self._reseed_ref_loop = pkg.get("ref") or self.params.combined_loop
+                    # A reseed handler has already swapped state.context_tokens upstream.
+                    # Just request a one-shot bar realign against the new ref loop if present.
                     self._needs_bar_realign = True
+                    self._reseed_ref_loop   = pkg.get("ref") if isinstance(pkg, dict) else None
 
-                    print("🔁 Reseed installed at bar boundary; will realign before next slice")
+            time.sleep(0.001)
 
-            print(f"✅ Completed chunk {self.idx}")
+        # --- graceful stop: flush resampler tail so last bits become available if client requests them ---
+        try:
+            if self._resampler is not None:
+                tail = self._resampler.flush()
+                if tail.size:
+                    self._stream_out = tail if self._stream_out.size == 0 else _np.vstack([self._stream_out, tail])
+        except Exception as e:
+            print(f"⚠️  Resampler flush error: {e}")
 
         print("🛑 JamWorker stopped")
-
