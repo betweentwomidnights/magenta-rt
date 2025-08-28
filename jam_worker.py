@@ -79,6 +79,9 @@ class JamWorker(threading.Thread):
         self.mrt = mrt
         self.params = params
 
+        # external callers (FastAPI endpoints) use this for atomic updates
+        self._lock = threading.RLock()
+
         # generation state
         self.state = self.mrt.init_state()
         self.mrt.guidance_weight = float(self.params.guidance_weight)
@@ -115,7 +118,7 @@ class JamWorker(threading.Thread):
         self._cv = threading.Condition()
 
         # control flags
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._max_buffer_ahead = 5
 
         # reseed queue (install at next safe point)
@@ -128,7 +131,7 @@ class JamWorker(threading.Thread):
     # ---------- lifecycle ----------
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     # FastAPI reads this to block until the next sequential chunk is ready
     def get_next_chunk(self, timeout: float = 30.0) -> Optional[JamChunk]:
@@ -154,16 +157,17 @@ class JamWorker(threading.Thread):
                     self._outbox.pop(k, None)
 
     def update_knobs(self, *, guidance_weight=None, temperature=None, topk=None):
-        if guidance_weight is not None:
-            self.params.guidance_weight = float(guidance_weight)
-        if temperature is not None:
-            self.params.temperature = float(temperature)
-        if topk is not None:
-            self.params.topk = int(topk)
-        # push into mrt (thread-safe enough for our use)
-        self.mrt.guidance_weight = float(self.params.guidance_weight)
-        self.mrt.temperature     = float(self.params.temperature)
-        self.mrt.topk            = int(self.params.topk)
+        with self._lock:
+            if guidance_weight is not None:
+                self.params.guidance_weight = float(guidance_weight)
+            if temperature is not None:
+                self.params.temperature = float(temperature)
+            if topk is not None:
+                self.params.topk = int(topk)
+            # push into mrt
+            self.mrt.guidance_weight = float(self.params.guidance_weight)
+            self.mrt.temperature     = float(self.params.temperature)
+            self.mrt.topk            = int(self.params.topk)
 
     # ---------- context / reseed ----------
 
@@ -242,16 +246,18 @@ class JamWorker(threading.Thread):
     def reseed_from_waveform(self, wav: au.Waveform):
         """Immediate reseed: replace context from provided wave (bar-locked, exact length)."""
         context_tokens = self._encode_exact_context_tokens(wav)
-        s = self.mrt.init_state()
-        s.context_tokens = context_tokens
-        self.state = s
-        self._model_stream = None  # drop model-domain continuity so next chunk starts cleanly
-        self._original_context_tokens = np.copy(context_tokens)
+        with self._lock:
+            s = self.mrt.init_state()
+            s.context_tokens = context_tokens
+            self.state = s
+            self._model_stream = None  # drop model-domain continuity so next chunk starts cleanly
+            self._original_context_tokens = np.copy(context_tokens)
 
     def reseed_splice(self, recent_wav: au.Waveform, anchor_bars: float):
         """Queue a splice reseed to be applied right after the next emitted loop."""
         new_ctx = self._encode_exact_context_tokens(recent_wav)
-        self._pending_reseed = {"ctx": new_ctx}
+        with self._lock:
+            self._pending_reseed = {"ctx": new_ctx}
 
 
     def reseed_from_waveform(self, wav: au.Waveform):
@@ -366,21 +372,19 @@ class JamWorker(threading.Thread):
             self.idx += 1
 
             # If a reseed is queued, install it *right after* we finish a chunk
-            if self._pending_reseed is not None:
-                new_state = self.mrt.init_state()
-                new_state.context_tokens = self._pending_reseed["ctx"]
-                self.state = new_state
-                self._model_stream = None  # drop model-domain continuity so next chunk starts clean
-                self._pending_reseed = None
+            with self._lock:
+                if self._pending_reseed is not None:
+                    new_state = self.mrt.init_state()
+                    new_state.context_tokens = self._pending_reseed["ctx"]
+                    self.state = new_state
+                    self._model_stream = None
+                    self._pending_reseed = None
 
     # ---------- main loop ----------
 
     def run(self):
-        # set style vector if present
-        style_vec = self._style_vec
-
         # generate until stopped
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             # throttle generation if we are far ahead
             if not self._should_generate_next_chunk():
                 # still try to emit if spool already has enough
@@ -389,6 +393,9 @@ class JamWorker(threading.Thread):
                 continue
 
             # generate next model chunk
+            # snapshot current style vector under lock for this step
+            with self._lock:
+                style_vec = self._style_vec
             wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
             # append and spool
             self._append_model_chunk_and_spool(wav)
