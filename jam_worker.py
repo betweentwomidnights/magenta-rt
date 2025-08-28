@@ -375,7 +375,7 @@ class JamWorker(threading.Thread):
                 "tokens": spliced,
                 "debug": {"F": F, "D": D, "splice_frames": splice_frames, "frames_per_bar": frames_per_bar}
             }
-            }
+            
 
 
     def reseed_from_waveform(self, wav: au.Waveform):
