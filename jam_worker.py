@@ -332,8 +332,11 @@ class JamWorker(threading.Thread):
                 self._spool_written += y.shape[0]
 
     def _should_generate_next_chunk(self) -> bool:
-        # Don't let generation run too far ahead of consumption
-        return self.idx <= (self._last_consumed_index + self._max_buffer_ahead)
+        # Allow running ahead relative to whichever is larger: last *consumed*
+        # (explicit ack from client) or last *delivered* (implicit ack).
+        implicit_consumed = self._next_to_deliver - 1  # last chunk handed to client
+        horizon_anchor = max(self._last_consumed_index, implicit_consumed)
+        return self.idx <= (horizon_anchor + self._max_buffer_ahead)
 
     def _emit_ready(self):
         """Emit next chunk(s) if the spool has enough samples."""
@@ -395,7 +398,7 @@ class JamWorker(threading.Thread):
             # generate next model chunk
             # snapshot current style vector under lock for this step
             with self._lock:
-                style_vec = self._style_vec
+                style_vec = self.params.style_vec
             wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
             # append and spool
             self._append_model_chunk_and_spool(wav)
