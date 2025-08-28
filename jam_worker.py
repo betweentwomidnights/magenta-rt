@@ -174,6 +174,91 @@ class JamWorker(threading.Thread):
 
     # ---------- context / reseed ----------
 
+    def _expected_token_shape(self) -> Tuple[int, int]:
+        F = int(self._ctx_frames)
+        D = int(self.mrt.config.decoder_codec_rvq_depth)
+        return F, D
+
+    def _coerce_tokens(self, toks: np.ndarray) -> np.ndarray:
+        """Force tokens to (context_length_frames, rvq_depth), padding/trimming as needed.
+        Pads missing frames by repeating the last frame (safer than zeros for RVQ stacks)."""
+        F, D = self._expected_token_shape()
+        if toks.ndim != 2:
+            toks = np.atleast_2d(toks)
+        # depth first
+        if toks.shape[1] > D:
+            toks = toks[:, :D]
+        elif toks.shape[1] < D:
+            pad_cols = np.tile(toks[:, -1:], (1, D - toks.shape[1]))
+            toks = np.concatenate([toks, pad_cols], axis=1)
+        # frames
+        if toks.shape[0] < F:
+            if toks.shape[0] == 0:
+                toks = np.zeros((1, D), dtype=np.int32)
+            pad = np.repeat(toks[-1:, :], F - toks.shape[0], axis=0)
+            toks = np.concatenate([pad, toks], axis=0)
+        elif toks.shape[0] > F:
+            toks = toks[-F:, :]
+        if toks.dtype != np.int32:
+            toks = toks.astype(np.int32, copy=False)
+        return toks
+
+    def _encode_exact_context_tokens(self, loop: au.Waveform) -> np.ndarray:
+        """Build *exactly* context_length_frames worth of tokens (e.g., 250 @ 25fps),
+        while ensuring the *end* of the audio lands on a bar boundary.
+        Strategy: take the largest integer number of bars <= ctx_seconds as the tail,
+        then left-fill from just before that tail (wrapping if needed) to reach exactly
+        ctx_seconds; finally, pad/trim to exact samples and, as a last resort, pad/trim
+        tokens to the expected frame count.
+        """
+        wav = loop.as_stereo().resample(self._model_sr)
+        data = wav.samples.astype(np.float32, copy=False)
+        if data.ndim == 1:
+            data = data[:, None]
+
+        spb = self._bar_clock.seconds_per_bar()
+        ctx_sec = float(self._ctx_seconds)
+        sr = int(self._model_sr)
+
+        # bars that fit fully inside ctx_sec (at least 1)
+        bars_fit = max(1, int(ctx_sec // spb))
+        tail_len_samps = int(round(bars_fit * spb * sr))
+
+        # ensure we have enough source by tiling
+        need = int(round(ctx_sec * sr)) + tail_len_samps
+        if data.shape[0] == 0:
+            data = np.zeros((1, 2), dtype=np.float32)
+        reps = int(np.ceil(need / float(data.shape[0])))
+        tiled = np.tile(data, (reps, 1))
+
+        end = tiled.shape[0]
+        tail = tiled[end - tail_len_samps:end]
+
+        # left-fill to reach exact ctx samples (keeps end-of-bar alignment)
+        ctx_samps = int(round(ctx_sec * sr))
+        pad_len = ctx_samps - tail.shape[0]
+        if pad_len > 0:
+            pre = tiled[end - tail_len_samps - pad_len:end - tail_len_samps]
+            ctx = np.concatenate([pre, tail], axis=0)
+        else:
+            ctx = tail[-ctx_samps:]
+
+        # final snap to *exact* ctx samples
+        if ctx.shape[0] < ctx_samps:
+            pad = np.zeros((ctx_samps - ctx.shape[0], ctx.shape[1]), dtype=np.float32)
+            ctx = np.concatenate([pad, ctx], axis=0)
+        elif ctx.shape[0] > ctx_samps:
+            ctx = ctx[-ctx_samps:]
+
+        exact = au.Waveform(ctx, sr)
+        tokens_full = self.mrt.codec.encode(exact).astype(np.int32)
+        depth = int(self.mrt.config.decoder_codec_rvq_depth)
+        tokens = tokens_full[:, :depth]
+
+        # Force expected (F,D) at *return time*
+        tokens = self._coerce_tokens(tokens)
+        return tokens
+
     def _encode_exact_context_tokens(self, loop: au.Waveform) -> np.ndarray:
         """Build *exactly* context_length_frames worth of tokens (e.g., 250 @ 25fps),
         while ensuring the *end* of the audio lands on a bar boundary.
@@ -262,43 +347,34 @@ class JamWorker(threading.Thread):
         (e.g., 250 frames), then splice only the *tail* corresponding to
         `anchor_bars` so generation continues smoothly without resetting state.
         """
-        new_ctx = self._encode_exact_context_tokens(recent_wav)  # (F,D)
-        F = int(self._ctx_frames)
-        D = int(self.mrt.config.decoder_codec_rvq_depth)
-        assert new_ctx.shape == (F, D), f"expected {(F, D)}, got {new_ctx.shape}"
+        new_ctx = self._encode_exact_context_tokens(recent_wav)  # coerce to (F,D)
+        F, D = self._expected_token_shape()
 
         # how many frames correspond to the requested anchor bars
         spb = self._bar_clock.seconds_per_bar()
-        frames_per_bar = int(round(self._codec_fps * spb))
-        splice_frames = int(round(max(1, anchor_bars) * frames_per_bar))
-        splice_frames = max(1, min(splice_frames, F))
+        frames_per_bar = max(1, int(round(self._codec_fps * spb)))
+        splice_frames = max(1, min(int(round(max(1.0, float(anchor_bars)) * frames_per_bar)), F))
 
         with self._lock:
             # snapshot current context
             cur = getattr(self.state, "context_tokens", None)
             if cur is None:
-                # if state has no context yet, fall back to full reseed
+                # fall back to full reseed (still coerced)
                 self._pending_reseed = {"ctx": new_ctx}
                 return
-            if cur.shape != (F, D):
-                # safety: coerce by trim/pad
-                if cur.shape[0] > F:
-                    cur = cur[-F:, :]
-                elif cur.shape[0] < F:
-                    pad = np.repeat(cur[0:1, :], F - cur.shape[0], axis=0)
-                    cur = np.concatenate([pad, cur], axis=0)
-                if cur.shape[1] != D:
-                    cur = cur[:, :D]
+            cur = self._coerce_tokens(cur)
 
             # build the spliced tensor: keep left (F - splice) from cur, take right (splice) from new
             left = cur[:F - splice_frames, :]
             right = new_ctx[F - splice_frames:, :]
             spliced = np.concatenate([left, right], axis=0)
+            spliced = self._coerce_tokens(spliced)
 
             # queue for install at the *next bar boundary* right after emission
             self._pending_token_splice = {
                 "tokens": spliced,
                 "debug": {"F": F, "D": D, "splice_frames": splice_frames, "frames_per_bar": frames_per_bar}
+            }
             }
 
 
@@ -420,22 +496,22 @@ class JamWorker(threading.Thread):
             with self._lock:
                 # Prefer seamless token splice when available
                 if self._pending_token_splice is not None:
+                    spliced = self._coerce_tokens(self._pending_token_splice["tokens"])
                     try:
-                        spliced = self._pending_token_splice["tokens"]
-                        self.state.context_tokens = spliced  # in-place, no reset
+                        # inplace update (no reset)
+                        self.state.context_tokens = spliced
                         self._pending_token_splice = None
-                        # do NOT reset self._model_stream — keep continuity
-                        # leave params/style as-is
-                    except Exception as e:
-                        # fallback: full reseed if setter rejects
+                    except Exception:
+                        # fallback: full reseed using spliced tokens
                         new_state = self.mrt.init_state()
                         new_state.context_tokens = spliced
                         self.state = new_state
                         self._model_stream = None
                         self._pending_token_splice = None
                 elif self._pending_reseed is not None:
+                    ctx = self._coerce_tokens(self._pending_reseed["ctx"])
                     new_state = self.mrt.init_state()
-                    new_state.context_tokens = self._pending_reseed["ctx"]
+                    new_state.context_tokens = ctx
                     self.state = new_state
                     self._model_stream = None
                     self._pending_reseed = None
