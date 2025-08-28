@@ -71,6 +71,7 @@ class BarClock:
 # -----------------------------
 
 class JamWorker(threading.Thread):
+    FRAMES_PER_SECOND: float | None = None  # filled in __init__ once codec is available
     """Generates continuous audio with MagentaRT, spools it at target SR,
     and emits *sample-accurate*, bar-aligned chunks (no FPS drift)."""
 
@@ -93,6 +94,7 @@ class JamWorker(threading.Thread):
 
         # codec/setup
         self._codec_fps = float(self.mrt.codec.frame_rate)
+        JamWorker.FRAMES_PER_SECOND = self._codec_fps
         self._ctx_frames = int(self.mrt.config.context_length_frames)
         self._ctx_seconds = self._ctx_frames / self._codec_fps
 
@@ -121,8 +123,9 @@ class JamWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._max_buffer_ahead = 5
 
-        # reseed queue (install at next safe point)
-        self._pending_reseed: Optional[dict] = None
+        # reseed queues (install at next bar boundary after emission)
+        self._pending_reseed: Optional[dict] = None           # legacy full reset path (kept for fallback)
+        self._pending_token_splice: Optional[dict] = None     # seamless token splice
 
         # Prepare initial context from combined loop (best musical alignment)
         if self.params.combined_loop is not None:
@@ -254,10 +257,49 @@ class JamWorker(threading.Thread):
             self._original_context_tokens = np.copy(context_tokens)
 
     def reseed_splice(self, recent_wav: au.Waveform, anchor_bars: float):
-        """Queue a splice reseed to be applied right after the next emitted loop."""
-        new_ctx = self._encode_exact_context_tokens(recent_wav)
+        """Queue a *seamless* reseed by token splicing instead of full restart.
+        We compute a fresh, bar-locked context token tensor of exact length
+        (e.g., 250 frames), then splice only the *tail* corresponding to
+        `anchor_bars` so generation continues smoothly without resetting state.
+        """
+        new_ctx = self._encode_exact_context_tokens(recent_wav)  # (F,D)
+        F = int(self._ctx_frames)
+        D = int(self.mrt.config.decoder_codec_rvq_depth)
+        assert new_ctx.shape == (F, D), f"expected {(F, D)}, got {new_ctx.shape}"
+
+        # how many frames correspond to the requested anchor bars
+        spb = self._bar_clock.seconds_per_bar()
+        frames_per_bar = int(round(self._codec_fps * spb))
+        splice_frames = int(round(max(1, anchor_bars) * frames_per_bar))
+        splice_frames = max(1, min(splice_frames, F))
+
         with self._lock:
-            self._pending_reseed = {"ctx": new_ctx}
+            # snapshot current context
+            cur = getattr(self.state, "context_tokens", None)
+            if cur is None:
+                # if state has no context yet, fall back to full reseed
+                self._pending_reseed = {"ctx": new_ctx}
+                return
+            if cur.shape != (F, D):
+                # safety: coerce by trim/pad
+                if cur.shape[0] > F:
+                    cur = cur[-F:, :]
+                elif cur.shape[0] < F:
+                    pad = np.repeat(cur[0:1, :], F - cur.shape[0], axis=0)
+                    cur = np.concatenate([pad, cur], axis=0)
+                if cur.shape[1] != D:
+                    cur = cur[:, :D]
+
+            # build the spliced tensor: keep left (F - splice) from cur, take right (splice) from new
+            left = cur[:F - splice_frames, :]
+            right = new_ctx[F - splice_frames:, :]
+            spliced = np.concatenate([left, right], axis=0)
+
+            # queue for install at the *next bar boundary* right after emission
+            self._pending_token_splice = {
+                "tokens": spliced,
+                "debug": {"F": F, "D": D, "splice_frames": splice_frames, "frames_per_bar": frames_per_bar}
+            }
 
 
     def reseed_from_waveform(self, wav: au.Waveform):
@@ -376,7 +418,22 @@ class JamWorker(threading.Thread):
 
             # If a reseed is queued, install it *right after* we finish a chunk
             with self._lock:
-                if self._pending_reseed is not None:
+                # Prefer seamless token splice when available
+                if self._pending_token_splice is not None:
+                    try:
+                        spliced = self._pending_token_splice["tokens"]
+                        self.state.context_tokens = spliced  # in-place, no reset
+                        self._pending_token_splice = None
+                        # do NOT reset self._model_stream — keep continuity
+                        # leave params/style as-is
+                    except Exception as e:
+                        # fallback: full reseed if setter rejects
+                        new_state = self.mrt.init_state()
+                        new_state.context_tokens = spliced
+                        self.state = new_state
+                        self._model_stream = None
+                        self._pending_token_splice = None
+                elif self._pending_reseed is not None:
                     new_state = self.mrt.init_state()
                     new_state.context_tokens = self._pending_reseed["ctx"]
                     self.state = new_state
