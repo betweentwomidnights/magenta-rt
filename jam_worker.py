@@ -167,21 +167,92 @@ class JamWorker(threading.Thread):
 
     # ---------- context / reseed ----------
 
-    def _install_context_from_loop(self, loop: au.Waveform):
-        # Build a bar-aligned tail and encode to context tokens
-        loop = loop.as_stereo().resample(self._model_sr)
-        tail = take_bar_aligned_tail(loop, self.params.bpm, self.params.beats_per_bar, self._ctx_seconds)
-        tokens_full = self.mrt.codec.encode(tail).astype(np.int32)
-        depth = int(self.mrt.config.decoder_codec_rvq_depth)
-        context_tokens = tokens_full[:, :depth]
+    def _encode_exact_context_tokens(self, loop: au.Waveform) -> np.ndarray:
+        """Build *exactly* context_length_frames worth of tokens (e.g., 250 @ 25fps),
+        while ensuring the *end* of the audio lands on a bar boundary.
+        Strategy: take the largest integer number of bars <= ctx_seconds as the tail,
+        then left-fill from just before that tail (wrapping if needed) to reach exactly
+        ctx_seconds; finally, pad/trim to exact samples and, as a last resort, pad/trim
+        tokens to the expected frame count.
+        """
+        wav = loop.as_stereo().resample(self._model_sr)
+        data = wav.samples.astype(np.float32, copy=False)
+        if data.ndim == 1:
+            data = data[:, None]
 
-        # install state
+        spb = self._bar_clock.seconds_per_bar()
+        ctx_sec = float(self._ctx_seconds)
+        sr = int(self._model_sr)
+
+        # bars that fit fully inside ctx_sec (at least 1)
+        bars_fit = max(1, int(ctx_sec // spb))
+        tail_len_samps = int(round(bars_fit * spb * sr))
+
+        # ensure we have enough source by tiling
+        need = int(round(ctx_sec * sr)) + tail_len_samps
+        if data.shape[0] == 0:
+            data = np.zeros((1, 2), dtype=np.float32)
+        reps = int(np.ceil(need / float(data.shape[0])))
+        tiled = np.tile(data, (reps, 1))
+
+        end = tiled.shape[0]
+        tail = tiled[end - tail_len_samps:end]
+
+        # left-fill to reach exact ctx samples (keeps end-of-bar alignment)
+        ctx_samps = int(round(ctx_sec * sr))
+        pad_len = ctx_samps - tail.shape[0]
+        if pad_len > 0:
+            pre = tiled[end - tail_len_samps - pad_len:end - tail_len_samps]
+            ctx = np.concatenate([pre, tail], axis=0)
+        else:
+            ctx = tail[-ctx_samps:]
+
+        # final snap to *exact* ctx samples
+        if ctx.shape[0] < ctx_samps:
+            pad = np.zeros((ctx_samps - ctx.shape[0], ctx.shape[1]), dtype=np.float32)
+            ctx = np.concatenate([pad, ctx], axis=0)
+        elif ctx.shape[0] > ctx_samps:
+            ctx = ctx[-ctx_samps:]
+
+        exact = au.Waveform(ctx, sr)
+        tokens_full = self.mrt.codec.encode(exact).astype(np.int32)
+        depth = int(self.mrt.config.decoder_codec_rvq_depth)
+        tokens = tokens_full[:, :depth]
+
+        # Last defense: force expected frame count
+        frames = tokens.shape[0]
+        exp = int(self._ctx_frames)
+        if frames < exp:
+            # repeat last frame
+            pad = np.repeat(tokens[-1:, :], exp - frames, axis=0)
+            tokens = np.concatenate([pad, tokens], axis=0)
+        elif frames > exp:
+            tokens = tokens[-exp:, :]
+        return tokens
+
+
+    def _install_context_from_loop(self, loop: au.Waveform):
+        # Build exact-length, bar-locked context tokens
+        context_tokens = self._encode_exact_context_tokens(loop)
         s = self.mrt.init_state()
         s.context_tokens = context_tokens
         self.state = s
-
-        # keep an original copy for future splices
         self._original_context_tokens = np.copy(context_tokens)
+
+    def reseed_from_waveform(self, wav: au.Waveform):
+        """Immediate reseed: replace context from provided wave (bar-locked, exact length)."""
+        context_tokens = self._encode_exact_context_tokens(wav)
+        s = self.mrt.init_state()
+        s.context_tokens = context_tokens
+        self.state = s
+        self._model_stream = None  # drop model-domain continuity so next chunk starts cleanly
+        self._original_context_tokens = np.copy(context_tokens)
+
+    def reseed_splice(self, recent_wav: au.Waveform, anchor_bars: float):
+        """Queue a splice reseed to be applied right after the next emitted loop."""
+        new_ctx = self._encode_exact_context_tokens(recent_wav)
+        self._pending_reseed = {"ctx": new_ctx}
+
 
     def reseed_from_waveform(self, wav: au.Waveform):
         """Immediate reseed: replace context from provided wave (bar-aligned tail)."""
