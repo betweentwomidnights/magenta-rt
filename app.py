@@ -23,6 +23,7 @@ from typing import Optional
 
 
 import json, asyncio, base64
+import time
 
 # --- Patch T5X mesh helpers for GPUs on JAX >= 0.7 (coords present, no core_on_chip) ---
 def _patch_t5x_for_gpu_coords():
@@ -902,6 +903,27 @@ def read_root():
     """
     return Response(content=html_content, media_type="text/html")
 
+
+# ----------------------------
+# websockets route
+# ----------------------------
+
+
+
+def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
+    extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
+    if not extra:
+        return mrt.embed_style("warmup")
+    sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
+    embeds, weights = [], []
+    for i, s in enumerate(extra):
+        embeds.append(mrt.embed_style(s))
+        weights.append(sw[i] if i < len(sw) else 1.0)
+    wsum = sum(weights) or 1.0
+    weights = [w/wsum for w in weights]
+    import numpy as np
+    return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
 @app.websocket("/ws/jam")
 async def ws_jam(websocket: WebSocket):
     await websocket.accept()
@@ -1004,44 +1026,61 @@ async def ws_jam(websocket: WebSocket):
                         # seed a fresh state with a silent context like warmup
                         mrt = get_mrt()
                         state = mrt.init_state()
-                        # build exact-length silent context
                         codec_fps = float(mrt.codec.frame_rate)
                         ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
                         sr = int(mrt.sample_rate)
                         samples = int(max(1, round(ctx_seconds * sr)))
                         silent = au.Waveform(np.zeros((samples,2), np.float32), sr)
-                        tokens_full = mrt.codec.encode(silent).astype(np.int32)
-                        tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
+                        tokens = mrt.codec.encode(silent).astype(np.int32)[:, :mrt.config.decoder_codec_rvq_depth]
                         state.context_tokens = tokens
-                        # keep local “rt” loop state
+
                         websocket._mrt = mrt
                         websocket._state = state
-                        websocket._style = mrt.embed_style(params.get("styles","warmup"))
+                        websocket._style = _combine_styles(mrt,
+                                                        params.get("styles","warmup"),
+                                                        params.get("style_weights",""))
                         websocket._rt_running = True
                         websocket._rt_sr = sr
                         websocket._rt_topk = int(params.get("topk", 40))
                         websocket._rt_temp = float(params.get("temperature", 1.1))
                         websocket._rt_guid = float(params.get("guidance_weight", 1.1))
+                        websocket._pace = params.get("pace", "asap")  # "realtime" | "asap"
                         await send_json({"type":"started","mode":"rt"})
                         # kick off a background task to stream ~2s chunks
                         async def _rt_loop():
                             try:
+                                mrt = websocket._mrt
+                                chunk_secs = (mrt.config.chunk_length_frames * mrt.config.frame_length_samples) / float(mrt.sample_rate)
+                                target_next = time.perf_counter()
                                 while websocket._rt_running:
+                                    t0 = time.perf_counter()
                                     mrt.guidance_weight = websocket._rt_guid
-                                    mrt.temperature = websocket._rt_temp
-                                    mrt.topk = websocket._rt_topk
+                                    mrt.temperature     = websocket._rt_temp
+                                    mrt.topk            = websocket._rt_topk
+
+                                    # style already in websocket._style
                                     wav, new_state = mrt.generate_chunk(state=websocket._state, style=websocket._style)
                                     websocket._state = new_state
+
                                     x = wav.samples.astype(np.float32, copy=False)
                                     buf = io.BytesIO()
                                     sf.write(buf, x, mrt.sample_rate, subtype="FLOAT", format="WAV")
+
                                     if binary_audio:
                                         await websocket.send_bytes(buf.getvalue())
                                         await send_json({"type":"chunk_meta","metadata":{"sample_rate":mrt.sample_rate}})
                                     else:
                                         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
                                         await send_json({"type":"chunk","audio_base64":b64,
-                                                         "metadata":{"sample_rate":mrt.sample_rate}})
+                                                        "metadata":{"sample_rate":mrt.sample_rate}})
+
+                                    # --- pacing ---
+                                    if getattr(websocket, "_pace", "asap") == "realtime":
+                                        t1 = time.perf_counter()
+                                        target_next += chunk_secs
+                                        sleep_s = max(0.0, target_next - t1 - 0.02)  # tiny safety margin
+                                        if sleep_s > 0:
+                                            await asyncio.sleep(sleep_s)
                             except Exception as e:
                                 await send_json({"type":"error","error":str(e)})
                         asyncio.create_task(_rt_loop())
@@ -1088,8 +1127,13 @@ async def ws_jam(websocket: WebSocket):
                     websocket._rt_temp = float(msg.get("temperature", websocket._rt_temp))
                     websocket._rt_topk = int(msg.get("topk", websocket._rt_topk))
                     websocket._rt_guid = float(msg.get("guidance_weight", websocket._rt_guid))
-                    if "styles" in msg:
-                        websocket._style = websocket._mrt.embed_style(msg["styles"])
+
+                    if ("styles" in msg) or ("style_weights" in msg):
+                        websocket._style = _combine_styles(
+                            websocket._mrt,
+                            msg.get("styles", ""),
+                            msg.get("style_weights", "")
+                        )
                     await send_json({"type":"status","updated":"rt-knobs"})
 
             elif mtype == "consume" and mode == "bar":
