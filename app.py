@@ -1,6 +1,6 @@
 from magenta_rt import system, audio as au
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
@@ -20,6 +20,9 @@ import logging
 
 import gradio as gr
 from typing import Optional
+
+
+import json, asyncio, base64
 
 # --- Patch T5X mesh helpers for GPUs on JAX >= 0.7 (coords present, no core_on_chip) ---
 def _patch_t5x_for_gpu_coords():
@@ -898,3 +901,262 @@ def read_root():
     </html>
     """
     return Response(content=html_content, media_type="text/html")
+
+@app.websocket("/ws/jam")
+async def ws_jam(websocket: WebSocket):
+    await websocket.accept()
+    sid = None
+    worker = None
+    binary_audio = False
+    mode = "rt"  # or "bar"
+
+    async def send_json(obj):
+        await websocket.send_text(json.dumps(obj))
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            mtype = msg.get("type")
+
+            # --- START ---
+            if mtype == "start":
+                binary_audio = bool(msg.get("binary_audio", False))
+                mode = msg.get("mode", "bar")
+                params = msg.get("params", {}) or {}
+                sid = msg.get("session_id")
+
+                # attach or create
+                if sid:
+                    with jam_lock:
+                        worker = jam_registry.get(sid)
+                    if worker is None or not worker.is_alive():
+                        await send_json({"type":"error","error":"Session not found"})
+                        continue
+                else:
+                    # optionally accept base64 loop and start a new worker (bar-mode)
+                    if mode == "bar":
+                        loop_b64 = msg.get("loop_audio_b64")
+                        if not loop_b64:
+                            await send_json({"type":"error","error":"loop_audio_b64 required for mode=bar when no session_id"})
+                            continue
+                        loop_bytes = base64.b64decode(loop_b64)
+                        # mimic /jam/start
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                            tmp.write(loop_bytes); tmp_path = tmp.name
+                        # build JamParams similar to /jam/start
+                        mrt = get_mrt()
+                        model_sr = int(mrt.sample_rate)  # typically 48000
+                        # Defaults for WS: raw loudness @ model SR, unless overridden by client:
+                        target_sr = int(params.get("target_sr", model_sr))
+                        loudness_mode = params.get("loudness_mode", "none")
+                        headroom_db = float(params.get("headroom_db", 1.0))
+                        loop = au.Waveform.from_file(tmp_path).resample(mrt.sample_rate).as_stereo()
+
+                        codec_fps = float(mrt.codec.frame_rate)
+                        ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
+                        bpm = float(params.get("bpm", 120.0))
+                        bpb = int(params.get("beats_per_bar", 4))
+                        loop_tail = take_bar_aligned_tail(loop, bpm, bpb, ctx_seconds)
+
+                        # style vector (loop + extra styles)
+                        embeds, weights = [mrt.embed_style(loop_tail)], [float(params.get("loop_weight", 1.0))]
+                        extra = [s for s in (params.get("styles","").split(",")) if s.strip()]
+                        sw = [float(x) for x in params.get("style_weights","").split(",") if x.strip()]
+                        for i, s in enumerate(extra):
+                            embeds.append(mrt.embed_style(s.strip()))
+                            weights.append(sw[i] if i < len(sw) else 1.0)
+                        wsum = sum(weights) or 1.0
+                        weights = [w/wsum for w in weights]
+                        style_vec = np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
+                        # target SR fallback: input SR
+                        inp_info = sf.info(tmp_path)
+                        target_sr = int(params.get("target_sr", int(inp_info.samplerate)))
+
+                        # Build JamParams for WS bar-mode
+                        jp = JamParams(
+                            bpm=bpm, beats_per_bar=bpb, bars_per_chunk=int(params.get("bars_per_chunk", 8)),
+                            target_sr=target_sr,
+                            loudness_mode=loudness_mode, headroom_db=headroom_db,
+                            style_vec=style_vec,
+                            ref_loop=None if loudness_mode == "none" else loop_tail,  # disable match by default
+                            combined_loop=loop,
+                            guidance_weight=float(params.get("guidance_weight", 1.1)),
+                            temperature=float(params.get("temperature", 1.1)),
+                            topk=int(params.get("topk", 40)),
+                        )
+                        worker = JamWorker(get_mrt(), jp)
+                        sid = str(uuid.uuid4())
+                        with jam_lock:
+                            # single active jam per GPU, mirroring /jam/start
+                            for _sid, w in list(jam_registry.items()):
+                                if w.is_alive():
+                                    await send_json({"type":"error","error":"A jam is already running"})
+                                    worker = None; sid = None
+                                    break
+                            if worker is not None:
+                                jam_registry[sid] = worker
+                                worker.start()
+
+                    else:
+                        # mode == "rt" (Colab-style, no loop context)
+                        # seed a fresh state with a silent context like warmup
+                        mrt = get_mrt()
+                        state = mrt.init_state()
+                        # build exact-length silent context
+                        codec_fps = float(mrt.codec.frame_rate)
+                        ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
+                        sr = int(mrt.sample_rate)
+                        samples = int(max(1, round(ctx_seconds * sr)))
+                        silent = au.Waveform(np.zeros((samples,2), np.float32), sr)
+                        tokens_full = mrt.codec.encode(silent).astype(np.int32)
+                        tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
+                        state.context_tokens = tokens
+                        # keep local “rt” loop state
+                        websocket._mrt = mrt
+                        websocket._state = state
+                        websocket._style = mrt.embed_style(params.get("styles","warmup"))
+                        websocket._rt_running = True
+                        websocket._rt_sr = sr
+                        websocket._rt_topk = int(params.get("topk", 40))
+                        websocket._rt_temp = float(params.get("temperature", 1.1))
+                        websocket._rt_guid = float(params.get("guidance_weight", 1.1))
+                        await send_json({"type":"started","mode":"rt"})
+                        # kick off a background task to stream ~2s chunks
+                        async def _rt_loop():
+                            try:
+                                while websocket._rt_running:
+                                    mrt.guidance_weight = websocket._rt_guid
+                                    mrt.temperature = websocket._rt_temp
+                                    mrt.topk = websocket._rt_topk
+                                    wav, new_state = mrt.generate_chunk(state=websocket._state, style=websocket._style)
+                                    websocket._state = new_state
+                                    x = wav.samples.astype(np.float32, copy=False)
+                                    buf = io.BytesIO()
+                                    sf.write(buf, x, mrt.sample_rate, subtype="FLOAT", format="WAV")
+                                    if binary_audio:
+                                        await websocket.send_bytes(buf.getvalue())
+                                        await send_json({"type":"chunk_meta","metadata":{"sample_rate":mrt.sample_rate}})
+                                    else:
+                                        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                                        await send_json({"type":"chunk","audio_base64":b64,
+                                                         "metadata":{"sample_rate":mrt.sample_rate}})
+                            except Exception as e:
+                                await send_json({"type":"error","error":str(e)})
+                        asyncio.create_task(_rt_loop())
+                        continue  # skip the “bar-mode started” message below
+
+                await send_json({"type":"started","session_id": sid, "mode": mode})
+
+                # if we’re in bar-mode, begin pushing chunks as they arrive
+                if mode == "bar" and worker is not None:
+                    async def _pump():
+                        while True:
+                            if not worker.is_alive():
+                                break
+                            chunk = worker.get_next_chunk(timeout=60.0)
+                            if chunk is None:
+                                continue
+                            if binary_audio:
+                                await websocket.send_bytes(base64.b64decode(chunk.audio_base64))
+                                await send_json({"type":"chunk_meta","index":chunk.index,"metadata":chunk.metadata})
+                            else:
+                                await send_json({"type":"chunk","index":chunk.index,
+                                                 "audio_base64":chunk.audio_base64,"metadata":chunk.metadata})
+                    asyncio.create_task(_pump())
+
+            # --- UPDATES (bar or rt) ---
+            elif mtype == "update":
+                if mode == "bar":
+                    if not sid:
+                        await send_json({"type":"error","error":"No session_id yet"}); return
+                    # fan values straight into your existing HTTP handler:
+                    res = jam_update(
+                        session_id=sid,
+                        guidance_weight=msg.get("guidance_weight"),
+                        temperature=msg.get("temperature"),
+                        topk=msg.get("topk"),
+                        styles=msg.get("styles",""),
+                        style_weights=msg.get("style_weights",""),
+                        loop_weight=msg.get("loop_weight"),
+                        use_current_mix_as_style=bool(msg.get("use_current_mix_as_style", False)),
+                    )
+                    await send_json({"type":"status", **res})  # {"ok": True}
+                else:
+                    # rt-mode: there’s no JamWorker; update the local knobs/state
+                    websocket._rt_temp = float(msg.get("temperature", websocket._rt_temp))
+                    websocket._rt_topk = int(msg.get("topk", websocket._rt_topk))
+                    websocket._rt_guid = float(msg.get("guidance_weight", websocket._rt_guid))
+                    if "styles" in msg:
+                        websocket._style = websocket._mrt.embed_style(msg["styles"])
+                    await send_json({"type":"status","updated":"rt-knobs"})
+
+            elif mtype == "consume" and mode == "bar":
+                with jam_lock:
+                    worker = jam_registry.get(msg.get("session_id"))
+                if worker is not None:
+                    worker.mark_chunk_consumed(int(msg.get("chunk_index", -1)))
+
+            elif mtype == "reseed" and mode == "bar":
+                with jam_lock:
+                    worker = jam_registry.get(msg.get("session_id"))
+                if worker is None or not worker.is_alive():
+                    await send_json({"type":"error","error":"Session not found"}); continue
+                loop_b64 = msg.get("loop_audio_b64")
+                if not loop_b64:
+                    await send_json({"type":"error","error":"loop_audio_b64 required"}); continue
+                loop_bytes = base64.b64decode(loop_b64)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(loop_bytes); path = tmp.name
+                wav = au.Waveform.from_file(path).resample(worker.mrt.sample_rate).as_stereo()
+                worker.reseed_from_waveform(wav)
+                await send_json({"type":"status","reseeded":True})
+
+            elif mtype == "reseed_splice" and mode == "bar":
+                with jam_lock:
+                    worker = jam_registry.get(msg.get("session_id"))
+                if worker is None or not worker.is_alive():
+                    await send_json({"type":"error","error":"Session not found"}); continue
+                anchor = float(msg.get("anchor_bars", 2.0))
+                b64 = msg.get("combined_audio_b64")
+                if b64:
+                    data = base64.b64decode(b64)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                        tmp.write(data); path = tmp.name
+                    wav = au.Waveform.from_file(path).resample(worker.mrt.sample_rate).as_stereo()
+                    worker.reseed_splice(wav, anchor_bars=anchor)
+                else:
+                    # fallback: model-side stream splice
+                    worker.reseed_splice(worker.params.combined_loop, anchor_bars=anchor)
+                await send_json({"type":"status","splice":anchor})
+
+            elif mtype == "stop":
+                if mode == "rt":
+                    websocket._rt_running = False
+                else:
+                    with jam_lock:
+                        worker = jam_registry.get(msg.get("session_id"))
+                    if worker is not None:
+                        worker.stop()
+                await send_json({"type":"stopped"}); break
+
+            elif mtype == "ping":
+                await send_json({"type":"pong"})
+
+            else:
+                await send_json({"type":"error","error":f"Unknown type {mtype}"})
+
+    except WebSocketDisconnect:
+        # best-effort cleanup for bar-mode sessions started within this socket (optional)
+        pass
+    except Exception as e:
+        try:
+            await send_json({"type":"error","error":str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
