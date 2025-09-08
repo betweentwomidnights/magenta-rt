@@ -103,7 +103,10 @@ class JamWorker(threading.Thread):
         self._model_sr = int(self.mrt.sample_rate)
 
         # target-SR in-RAM spool (what we cut loops from)
-        self._rs = StreamingResampler(self._model_sr, int(self.params.target_sr), channels=2)
+        if int(self.params.target_sr) != int(self._model_sr):
+            self._rs = StreamingResampler(self._model_sr, int(self.params.target_sr), channels=2)
+        else:
+            self._rs = None
         self._spool = np.zeros((0, 2), dtype=np.float32)   # (S,2) target SR
         self._spool_written = 0                            # absolute frames written into spool
 
@@ -425,7 +428,9 @@ class JamWorker(threading.Thread):
             new_part = s[xfade_n:] if xfade_n < s.shape[0] else s[:0]
             self._model_stream = new_part.copy()
             if new_part.size:
-                y = self._rs.process(new_part, final=False)
+                y = (new_part.astype(np.float32, copy=False)
+                     if self._rs is None else
+                     self._rs.process(new_part.astype(np.float32, copy=False), final=False))
                 self._spool = np.concatenate([self._spool, y], axis=0)
                 self._spool_written += y.shape[0]
             return
@@ -444,7 +449,9 @@ class JamWorker(threading.Thread):
 
         # spool only the *new* non-overlapped part
         if new_part.size:
-            y = self._rs.process(new_part.astype(np.float32, copy=False), final=False)
+            y = (new_part.astype(np.float32, copy=False)
+                 if self._rs is None else
+                 self._rs.process(new_part.astype(np.float32, copy=False), final=False))
             if y.size:
                 self._spool = np.concatenate([self._spool, y], axis=0)
                 self._spool_written += y.shape[0]
