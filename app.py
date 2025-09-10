@@ -24,6 +24,28 @@ from typing import Optional
 
 import json, asyncio, base64
 import time
+
+# ---- Perf knobs (add at top of app.py) ----
+os.environ.setdefault("JAX_PLATFORMS", "cuda")  # prefer GPU
+os.environ.setdefault("XLA_FLAGS",
+    "--xla_gpu_enable_triton_gemm=true "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_autotune_level=2")
+# TF32 is enabled by default on Ampere/Ada for matmul; ensure not disabled:
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+
+import jax
+jax.config.update("jax_default_matmul_precision", "fastest")  # allow TF32
+# Optional: persist XLA compile artifacts across restarts (saves warmup time)
+try:
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache(os.environ.get("JAX_CACHE_DIR", "/home/appuser/.cache/jax"))
+except Exception:
+    pass
+# --------------------------------------------
+
+
+
 from starlette.websockets import WebSocketState
 try:
     from uvicorn.protocols.utils import ClientDisconnected  # uvicorn >= 0.20
