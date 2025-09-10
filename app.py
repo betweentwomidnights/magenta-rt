@@ -24,6 +24,24 @@ from typing import Optional
 
 import json, asyncio, base64
 import time
+from starlette.websockets import WebSocketState
+try:
+    from uvicorn.protocols.utils import ClientDisconnected  # uvicorn >= 0.20
+except Exception:
+    class ClientDisconnected(Exception):  # fallback
+        pass
+
+async def send_json_safe(ws: WebSocket, obj) -> bool:
+    """Try to send. Returns False if the socket is (or becomes) closed."""
+    if ws.client_state == WebSocketState.DISCONNECTED or ws.application_state == WebSocketState.DISCONNECTED:
+        return False
+    try:
+        await ws.send_text(json.dumps(obj))
+        return True
+    except (WebSocketDisconnect, ClientDisconnected, RuntimeError):
+        return False
+    except Exception:
+        return False
 
 # --- Patch T5X mesh helpers for GPUs on JAX >= 0.7 (coords present, no core_on_chip) ---
 def _patch_t5x_for_gpu_coords():
@@ -932,8 +950,9 @@ async def ws_jam(websocket: WebSocket):
     binary_audio = False
     mode = "rt"  # or "bar"
 
+    # NEW: capture ws in closure
     async def send_json(obj):
-        await websocket.send_text(json.dumps(obj))
+        return await send_json_safe(websocket, obj)
 
     try:
         while True:
@@ -1053,12 +1072,11 @@ async def ws_jam(websocket: WebSocket):
                                 chunk_secs = (mrt.config.chunk_length_frames * mrt.config.frame_length_samples) / float(mrt.sample_rate)
                                 target_next = time.perf_counter()
                                 while websocket._rt_running:
-                                    t0 = time.perf_counter()
+                                    # read knobs (already set by update)
                                     mrt.guidance_weight = websocket._rt_guid
                                     mrt.temperature     = websocket._rt_temp
                                     mrt.topk            = websocket._rt_topk
 
-                                    # style already in websocket._style
                                     wav, new_state = mrt.generate_chunk(state=websocket._state, style=websocket._style)
                                     websocket._state = new_state
 
@@ -1066,24 +1084,38 @@ async def ws_jam(websocket: WebSocket):
                                     buf = io.BytesIO()
                                     sf.write(buf, x, mrt.sample_rate, subtype="FLOAT", format="WAV")
 
+                                    # send bytes / json best-effort
+                                    ok = True
                                     if binary_audio:
-                                        await websocket.send_bytes(buf.getvalue())
-                                        await send_json({"type":"chunk_meta","metadata":{"sample_rate":mrt.sample_rate}})
+                                        try:
+                                            await websocket.send_bytes(buf.getvalue())
+                                            ok = await send_json({"type":"chunk_meta","metadata":{"sample_rate":mrt.sample_rate}})
+                                        except Exception:
+                                            ok = False
                                     else:
                                         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                                        await send_json({"type":"chunk","audio_base64":b64,
-                                                        "metadata":{"sample_rate":mrt.sample_rate}})
+                                        ok = await send_json({"type":"chunk","audio_base64":b64,
+                                                            "metadata":{"sample_rate":mrt.sample_rate}})
 
-                                    # --- pacing ---
+                                    if not ok:
+                                        # client went away — exit cleanly
+                                        break
+
+                                    # pacing (use captured flag from start)
                                     if getattr(websocket, "_pace", "asap") == "realtime":
                                         t1 = time.perf_counter()
                                         target_next += chunk_secs
-                                        sleep_s = max(0.0, target_next - t1 - 0.02)  # tiny safety margin
+                                        sleep_s = max(0.0, target_next - t1 - 0.02)
                                         if sleep_s > 0:
                                             await asyncio.sleep(sleep_s)
-                            except Exception as e:
-                                await send_json({"type":"error","error":str(e)})
-                        asyncio.create_task(_rt_loop())
+
+                            except asyncio.CancelledError:
+                                # normal on stop/close — just exit
+                                pass
+                            except Exception:
+                                # don't try to send an error; socket may be closed
+                                pass
+                        websocket._rt_task = asyncio.create_task(_rt_loop())
                         continue  # skip the “bar-mode started” message below
 
                 await send_json({"type":"started","session_id": sid, "mode": mode})
@@ -1178,12 +1210,13 @@ async def ws_jam(websocket: WebSocket):
             elif mtype == "stop":
                 if mode == "rt":
                     websocket._rt_running = False
-                else:
-                    with jam_lock:
-                        worker = jam_registry.get(msg.get("session_id"))
-                    if worker is not None:
-                        worker.stop()
-                await send_json({"type":"stopped"}); break
+                    task = getattr(websocket, "_rt_task", None)
+                    if task is not None:
+                        task.cancel()
+                        try: await task
+                        except asyncio.CancelledError: pass
+                    await send_json({"type":"stopped"})
+                    break  # <- add this if you want to end the socket after stop
 
             elif mtype == "ping":
                 await send_json({"type":"pong"})
@@ -1201,6 +1234,7 @@ async def ws_jam(websocket: WebSocket):
             pass
     finally:
         try:
-            await websocket.close()
+            if websocket.client_state != WebSocketState.DISCONNECTED:
+                await websocket.close()
         except Exception:
             pass
