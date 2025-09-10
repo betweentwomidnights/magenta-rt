@@ -15,7 +15,10 @@ os.environ.setdefault("JAX_CACHE_DIR", "/home/appuser/.cache/jax")
 import jax
 # ✅ Valid choices include: "default", "high", "highest", "tensorfloat32", "float32", etc.
 # TF32 is the sweet spot on Ampere/Ada GPUs for ~1.1–1.3× matmul speedups.
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+try:
+    jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+except Exception:
+    jax.config.update("jax_default_matmul_precision", "high")  # older alias
 
 # Initialize the on-disk compilation cache (best-effort)
 try:
@@ -447,7 +450,7 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                _MRT = system.MagentaRT(tag="large", guidance_weight=5.0, device="gpu", lazy=False)
+                _MRT = system.MagentaRT(tag="base", guidance_weight=5.0, device="gpu", lazy=False)
     return _MRT
 
 _WARMED = False
