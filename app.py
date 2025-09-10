@@ -1,3 +1,32 @@
+import os
+# Useful XLA GPU optimizations (harmless if a flag is unknown)
+os.environ.setdefault(
+    "XLA_FLAGS",
+    " ".join([
+        "--xla_gpu_enable_triton_gemm=true",
+        "--xla_gpu_enable_latency_hiding_scheduler=true",
+        "--xla_gpu_autotune_level=2",
+    ])
+)
+
+# Optional: persist JAX compile cache across restarts (reduces warmup time)
+os.environ.setdefault("JAX_CACHE_DIR", "/home/appuser/.cache/jax")
+
+import jax
+# ✅ Valid choices include: "default", "high", "highest", "tensorfloat32", "float32", etc.
+# TF32 is the sweet spot on Ampere/Ada GPUs for ~1.1–1.3× matmul speedups.
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+
+# Initialize the on-disk compilation cache (best-effort)
+try:
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache(os.environ["JAX_CACHE_DIR"])
+except Exception:
+    pass
+# --------------------------------------------------------------------
+
+
+
 from magenta_rt import system, audio as au
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect
@@ -15,7 +44,7 @@ from utils import (
 
 from jam_worker import JamWorker, JamParams, JamChunk
 import uuid, threading
-import os
+
 import logging
 
 import gradio as gr
@@ -24,25 +53,6 @@ from typing import Optional
 
 import json, asyncio, base64
 import time
-
-# ---- Perf knobs (add at top of app.py) ----
-os.environ.setdefault("JAX_PLATFORMS", "cuda")  # prefer GPU
-os.environ.setdefault("XLA_FLAGS",
-    "--xla_gpu_enable_triton_gemm=true "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_autotune_level=2")
-# TF32 is enabled by default on Ampere/Ada for matmul; ensure not disabled:
-os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
-
-import jax
-jax.config.update("jax_default_matmul_precision", "fastest")  # allow TF32
-# Optional: persist XLA compile artifacts across restarts (saves warmup time)
-try:
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.initialize_cache(os.environ.get("JAX_CACHE_DIR", "/home/appuser/.cache/jax"))
-except Exception:
-    pass
-# --------------------------------------------
 
 
 
