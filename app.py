@@ -475,6 +475,77 @@ def generate_loop_continuation_with_mrt(
 
     return out, loud_stats
 
+def generate_style_only_with_mrt(
+    mrt,
+    bpm: float,
+    bars: int = 8,
+    beats_per_bar: int = 4,
+    styles: str = "warmup",
+    style_weights: str = "",
+    intro_bars_to_drop: int = 0,
+):
+    """
+    Style-only, bar-aligned generation using a silent context (no input audio).
+    Returns: (au.Waveform out, dict loud_stats_or_None)
+    """
+    # ---- Build a 10s silent context, tokenized for the model ----
+    codec_fps   = float(mrt.codec.frame_rate)
+    ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
+    sr          = int(mrt.sample_rate)
+
+    silent = au.Waveform(np.zeros((int(round(ctx_seconds * sr)), 2), np.float32), sr)
+    tokens_full = mrt.codec.encode(silent).astype(np.int32)
+    tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
+
+    state = mrt.init_state()
+    state.context_tokens = tokens
+
+    # ---- Style vector (text prompts only, normalized weights) ----
+    prompts = [s.strip() for s in (styles.split(",") if styles else []) if s.strip()]
+    if not prompts:
+        prompts = ["warmup"]
+    sw = [float(x) for x in style_weights.split(",")] if style_weights else []
+    embeds, weights = [], []
+    for i, p in enumerate(prompts):
+        embeds.append(mrt.embed_style(p))
+        weights.append(sw[i] if i < len(sw) else 1.0)
+    wsum = float(sum(weights)) or 1.0
+    weights = [w / wsum for w in weights]
+    style_vec = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
+    # ---- Target length math ----
+    seconds_per_bar = beats_per_bar * (60.0 / bpm)
+    total_secs      = bars * seconds_per_bar
+    drop_bars       = max(0, int(intro_bars_to_drop))
+    drop_secs       = min(drop_bars, bars) * seconds_per_bar
+    gen_total_secs  = total_secs + drop_secs
+
+    # ~2.0s chunk length from model config
+    chunk_secs = (mrt.config.chunk_length_frames * mrt.config.frame_length_samples) / float(mrt.sample_rate)
+
+    # Generate enough chunks to cover total, plus a pad chunk for crossfade headroom
+    steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1
+
+    chunks = []
+    for _ in range(steps):
+        wav, state = mrt.generate_chunk(state=state, style=style_vec)
+        chunks.append(wav)
+
+    # Stitch & trim to exact musical length
+    stitched = stitch_generated(chunks, mrt.sample_rate, mrt.config.crossfade_length).as_stereo()
+    stitched = hard_trim_seconds(stitched, gen_total_secs)
+
+    if drop_secs > 0:
+        n_drop = int(round(drop_secs * stitched.sample_rate))
+        stitched = au.Waveform(stitched.samples[n_drop:], stitched.sample_rate)
+
+    out = hard_trim_seconds(stitched, total_secs)
+    out = out.peak_normalize(0.95)
+    apply_micro_fades(out, 5)
+
+    return out, None  # loudness stats not applicable (no reference)
+
+
 
 
 # ----------------------------
@@ -498,7 +569,7 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                _MRT = system.MagentaRT(tag="base", guidance_weight=5.0, device="gpu", lazy=False)
+                _MRT = system.MagentaRT(tag="large", guidance_weight=5.0, device="gpu", lazy=False)
     return _MRT
 
 _WARMED = False
@@ -662,6 +733,73 @@ def generate(
         "topk": topk,
     }
     return {"audio_base64": audio_b64, "metadata": metadata}
+
+# new endpoint to return a bar-aligned chunk without the need for combined audio
+
+@app.post("/generate_style")
+def generate_style(
+    bpm: float = Form(...),
+    bars: int = Form(8),
+    beats_per_bar: int = Form(4),
+    styles: str = Form("warmup"),
+    style_weights: str = Form(""),
+    guidance_weight: float = Form(1.1),
+    temperature: float = Form(1.1),
+    topk: int = Form(40),
+    target_sample_rate: int | None = Form(None),
+    intro_bars_to_drop: int = Form(0),
+):
+    """
+    Style-only, bar-aligned generation (no input audio).
+    Seeds with 10s of silent context; outputs exactly `bars` at the requested BPM.
+    """
+    mrt = get_mrt()
+
+    # Override sampling knobs just for this request
+    with mrt_overrides(mrt,
+                       guidance_weight=guidance_weight,
+                       temperature=temperature,
+                       topk=topk):
+        wav, _ = generate_style_only_with_mrt(
+            mrt,
+            bpm=bpm,
+            bars=bars,
+            beats_per_bar=beats_per_bar,
+            styles=styles,
+            style_weights=style_weights,
+            intro_bars_to_drop=intro_bars_to_drop,
+        )
+
+    # Determine target SR (defaults to model SR = 48k)
+    cur_sr = int(mrt.sample_rate)
+    target_sr = int(target_sample_rate or cur_sr)
+    x = wav.samples if wav.samples.ndim == 2 else wav.samples[:, None]
+
+    seconds_per_bar = (60.0 / float(bpm)) * int(beats_per_bar)
+    expected_secs   = float(bars) * seconds_per_bar
+
+    # Snap exactly to musical length at the requested sample rate
+    x = resample_and_snap(x, cur_sr=cur_sr, target_sr=target_sr, seconds=expected_secs)
+
+    audio_b64, total_samples, channels = wav_bytes_base64(x, target_sr)
+
+    metadata = {
+        "bpm": int(round(bpm)),
+        "bars": int(bars),
+        "beats_per_bar": int(beats_per_bar),
+        "styles": [s.strip() for s in (styles.split(",") if styles else []) if s.strip()],
+        "style_weights": [float(y) for y in style_weights.split(",")] if style_weights else None,
+        "sample_rate": int(target_sr),
+        "channels": int(channels),
+        "crossfade_seconds": mrt.config.crossfade_length,
+        "seconds_per_bar": seconds_per_bar,
+        "loop_duration_seconds": total_samples / float(target_sr),
+        "guidance_weight": guidance_weight,
+        "temperature": temperature,
+        "topk": topk,
+    }
+    return {"audio_base64": audio_b64, "metadata": metadata}
+
 
 # ----------------------------
 # the 'keep jamming' button
