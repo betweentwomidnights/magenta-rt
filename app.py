@@ -116,200 +116,248 @@ _patch_t5x_for_gpu_coords()
 
 def create_documentation_interface():
     """Create a Gradio interface for documentation and transparency"""
-    
     with gr.Blocks(title="MagentaRT Research API", theme=gr.themes.Soft()) as interface:
-        
-        gr.Markdown("""
-        # 🎵 MagentaRT Live Music Generation Research API
-        
-        **Research-only implementation for iOS app development**
-        
-        This API uses Google's [MagentaRT](https://github.com/magenta/magenta-realtime) to generate 
-        continuous music based on input audio loops for experimental iOS app development.
-        """)
-        
+        gr.Markdown(
+            r"""
+# 🎵 MagentaRT Live Music Generation Research API
+
+**Research-only implementation for iOS/web app development**
+
+This API uses Google's [MagentaRT](https://github.com/magenta/magenta-realtime) to generate
+continuous music either as **bar-aligned chunks over HTTP** or as **low-latency realtime chunks via WebSocket**.
+            """
+        )
+
         with gr.Tabs():
-            with gr.Tab("📖 About This Research"):
-                gr.Markdown("""
-                ## What This API Does
-                
-                We're exploring AI-assisted loop-based music creation for mobile apps. Websockets are notoriously annoying in ios-swift apps, so I tried to come up with an http version tailored to the loop based nature of an existing swift app. This API provides:
-                
-                ### 🎹 Single Generation (`/generate`)
-                - Upload audio loop + BPM + style parameters
-                - Returns 4-8 bars of AI-generated continuation
-                - **Performance**: 4 bars in ~9s, 8 bars in ~16s (L40S GPU)
-                
-                ### 🔄 Continuous Jamming (`/jam/*`)
-                - `/jam/start` - Begin continuous generation session
-                - `/jam/next` - Get next bar-aligned chunk
-                - `/jam/stop` - End session
-                - **Performance**: Real-time 8-bar chunks after warmup
-                
-                ## Technical Specs
-                - **Model**: MagentaRT (800M parameter transformer)
-                - **Quality**: 48kHz stereo output
-                - **Context**: 10-second audio analysis window
-                - **Styles**: Text descriptions (e.g., "acid house, techno")
-                
-                ## Research Goals
-                - Seamless AI music generation for loop-based composition
-                - Real-time parameter adjustment during generation
-                - Mobile-optimized music creation workflows
-                """)
-            
-            with gr.Tab("🔧 API Documentation"):
-                gr.Markdown("""
-                ## Single Generation Example
-                ```bash
-                curl -X POST "/generate" \\
-                     -F "loop_audio=@drum_loop.wav" \\
-                     -F "bpm=120" \\
-                     -F "bars=8" \\
-                     -F "styles=acid house,techno" \\
-                     -F "guidance_weight=5.0" \\
-                     -F "temperature=1.1"
-                ```
-                
-                ## Continuous Jamming Example
-                ```bash
-                # 1. Start session
-                SESSION=$(curl -X POST "/jam/start" \\
-                    -F "loop_audio=@loop.wav" \\
-                    -F "bpm=120" \\
-                    -F "bars_per_chunk=8" | jq -r .session_id)
-                
-                # 2. Get chunks in real-time
-                curl "/jam/next?session_id=$SESSION"
-                
-                # 3. Stop when done
-                curl -X POST "/jam/stop" \\
-                     -H "Content-Type: application/json" \\
-                     -d "{\\"session_id\\": \\"$SESSION\\"}"
-                ```
-                
-                ## Key Parameters
-                - **bpm**: 60-200 (beats per minute)
-                - **bars**: 1-16 (bars to generate)
-                - **styles**: Text descriptions, comma-separated
-                - **guidance_weight**: 0.1-10.0 (style adherence)
-                - **temperature**: 0.1-2.0 (randomness)
-                - **intro_bars_to_drop**: Skip N bars from start
-                
-                ## Response Format
-                ```json
-                {
-                  "audio_base64": "...",
-                  "metadata": {
-                    "bpm": 120,
-                    "bars": 8,
-                    "sample_rate": 48000,
-                    "loop_duration_seconds": 16.0
-                  }
-                }
-                ```
-                """)
-            
-            with gr.Tab("📱 iOS App Integration"):
-                gr.Markdown("""
-                ## How Our iOS App Uses This API
-                
-                ### User Flow
-                1. **Record/Import**: User provides drum or instrument loop
-                2. **Parameter Setup**: Set BPM, style, generation settings
-                3. **Continuous Generation**: App calls `/jam/start`
-                4. **Real-time Playback**: App fetches chunks via `/jam/next`
-                5. **Seamless Mixing**: Generated audio mixed into live stream
-                
-                ### Technical Implementation
-                - **Audio Format**: 48kHz WAV for consistency
-                - **Chunk Size**: 8 bars (~16 seconds at 120 BPM)
-                - **Buffer Management**: 3-5 chunks ahead for smooth playback
-                - **Style Updates**: Real-time parameter adjustment via `/jam/update`
-                
-                ### Networking Considerations
-                - **Latency**: ~2-3 seconds per chunk after warmup
-                - **Bandwidth**: ~500KB per 8-bar chunk (compressed)
-                - **Reliability**: Automatic retry with exponential backoff
-                - **Caching**: Local buffer for offline resilience
-                """)
-            
-            with gr.Tab("⚖️ Licensing & Legal"):
-                gr.Markdown("""
-                ## MagentaRT Licensing
-                
-                This project uses Google's MagentaRT model under:
-                - **Source Code**: Apache License 2.0
-                - **Model Weights**: Creative Commons Attribution 4.0 International
-                - **Usage Terms**: [See MagentaRT repository](https://github.com/magenta/magenta-realtime)
-                
-                ### Key Requirements
-                - ✅ **Attribution**: Credit MagentaRT in derivative works
-                - ✅ **Responsible Use**: Don't infringe copyrights
-                - ✅ **No Warranties**: Use at your own risk
-                - ✅ **Patent License**: Explicit patent grants included
-                
-                ## Our Implementation
-                - **Purpose**: Research and development only
-                - **Non-Commercial**: Experimental iOS app development
-                - **Open Source**: Will release implementation under Apache 2.0
-                - **Attribution**: Proper credit to Google Research team
-                
-                ### Required Attribution
-                ```
-                Generated using MagentaRT
-                Copyright 2024 Google LLC
-                Licensed under Apache 2.0 and CC-BY 4.0
-                Implementation for research purposes
-                ```
-                """)
-            
-            with gr.Tab("📊 Performance & Limits"):
-                gr.Markdown("""
-                ## Current Performance (L40S 48GB)
-                
-                ### ⚡ Single Generation
-                - **4 bars @ 100 BPM**: ~9 seconds
-                - **8 bars @ 100 BPM**: ~16 seconds
-                - **Memory usage**: ~40GB VRAM during generation
-                
-                ### 🔄 Continuous Jamming
-                - **Warmup**: ~10-15 seconds first chunk
-                - **8-bar chunks @ 120 BPM**: Real-time delivery
-                - **Buffer ahead**: 3-5 chunks for smooth playback
-                
-                ## Known Limitations
-                
-                ### 🎵 Model Limitations (MagentaRT)
-                - **Context**: 10-second maximum memory
-                - **Training**: Primarily Western instrumental music
-                - **Vocals**: Non-lexical only, no lyric conditioning
-                - **Structure**: No long-form song arrangement
-                - **Inside Swift**: After a few turns of continuous chunks, the swift app works best if you restart the jam from the combined audio again. In this way you might end up with a real jam.
-                
-                ### 🖥️ Infrastructure Limitations
-                - **Concurrency**: Single user jam sessions only
-                - **GPU Memory**: 40GB+ VRAM required for stable operation
-                - **Latency**: 2+ second minimum for style changes
-                - **Uptime**: Research setup, no SLA guarantees
-                
-                ## Resource Requirements
-                - **Minimum**: 24GB VRAM (basic operation, won't operate realtime enough for new chunks coming in)
-                - **Recommended**: 48GB VRAM (stable performance) 
-                - **CPU**: 8+ cores
-                - **System RAM**: 32GB+
-                - **Storage**: 50GB+ for model weights
-                """)
-                
-        gr.Markdown("""
-        ---
-        
-        **🔬 Research Project** | **📱 iOS Development** | **🎵 Powered by MagentaRT**
-        
-        This API is part of ongoing research into AI-assisted music creation for mobile devices.
-        For technical details, see the API documentation tabs above.
-        """)
-    
+            # ------------------------------------------------------------------
+            # About & current status
+            # ------------------------------------------------------------------
+            with gr.Tab("📖 About & Status"):
+                gr.Markdown(
+                    r"""
+## What this is
+We're exploring AI‑assisted loop‑based music creation that can run on GPUs (not just TPUs) and stream to apps in realtime.
+
+### Implemented backends
+- **HTTP (bar‑aligned):** `/generate`, `/jam/start`, `/jam/next`, `/jam/stop`, `/jam/update`, etc.
+- **WebSocket (realtime):** `ws://…/ws/jam` with `mode="rt"` (Colab‑style continuous chunks). New in this build.
+
+## What we learned (GPU notes)
+- **L40S 48GB:** comfortably **faster than realtime** → we added a `pace: "realtime"` switch so the server doesn’t outrun playback.
+- **L4 24GB:** **consistently just under realtime**; even with pre‑roll buffering, TF32/JAX tunings, reduced chunk size, and the **base** checkpoint, we still see eventual under‑runs.
+- **Implication:** For production‑quality realtime, aim for ~**40GB VRAM** per user/session (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer parts). Smaller GPUs can demo, but sustained realtime is not reliable.
+
+## Model / audio specs
+- **Model:** MagentaRT (T5X; decoder RVQ depth = 16)
+- **Audio:** 48 kHz stereo, 2.0 s chunks by default, 40 ms crossfade
+- **Context:** 10 s rolling context window
+                    """
+                )
+
+            # ------------------------------------------------------------------
+            # HTTP API
+            # ------------------------------------------------------------------
+            with gr.Tab("🔧 API (HTTP)"):
+                gr.Markdown(
+                    r"""
+### Single Generation
+```bash
+curl -X POST \
+  "$HOST/generate" \
+  -F "loop_audio=@drum_loop.wav" \
+  -F "bpm=120" \
+  -F "bars=8" \
+  -F "styles=acid house,techno" \
+  -F "guidance_weight=5.0" \
+  -F "temperature=1.1"
+```
+
+### Continuous Jamming (bar‑aligned, HTTP)
+```bash
+# 1) Start a session
+echo $(curl -s -X POST "$HOST/jam/start" \
+  -F "loop_audio=@loop.wav" \
+  -F "bpm=120" \
+  -F "bars_per_chunk=8") | jq .
+# → {"session_id":"…"}
+
+# 2) Pull next chunk (repeat)
+curl "$HOST/jam/next?session_id=$SESSION"
+
+# 3) Stop
+curl -X POST "$HOST/jam/stop" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"'$SESSION'"}'
+```
+
+### Common parameters
+- **bpm** *(int)* – beats per minute
+- **bars / bars_per_chunk** *(int)* – musical length
+- **styles** *(str)* – comma‑separated text prompts (mixed internally)
+- **guidance_weight** *(float)* – style adherence (CFG weight)
+- **temperature / topk** – sampling controls
+- **intro_bars_to_drop** *(int, /generate)* – generate-and-trim intro
+                    """
+                )
+
+            # ------------------------------------------------------------------
+            # WebSocket API: realtime (‘rt’ mode)
+            # ------------------------------------------------------------------
+            with gr.Tab("🧩 API (WebSocket • rt mode)"):
+                gr.Markdown(
+                    r"""
+Connect to `wss://…/ws/jam` and send a **JSON control stream**. In `rt` mode the server emits ~2 s WAV chunks (or binary frames) continuously.
+
+### Start (client → server)
+```jsonc
+{
+  "type": "start",
+  "mode": "rt",
+  "binary_audio": false,          // true → raw WAV bytes + separate chunk_meta
+  "params": {
+    "styles": "heavy metal",     // or "jazz, hiphop"
+    "style_weights": "1.0,1.0",  // optional, auto‑normalized
+    "temperature": 1.1,
+    "topk": 40,
+    "guidance_weight": 1.1,
+    "pace": "realtime",          // "realtime" | "asap" (default)
+    "max_decode_frames": 50       // 50≈2.0s; try 36–45 on smaller GPUs
+  }
+}
+```
+
+### Server events (server → client)
+- `{"type":"started","mode":"rt"}` – handshake
+- `{"type":"chunk","audio_base64":"…","metadata":{…}}` – base64 WAV
+  - `metadata.sample_rate` *(int)* – usually 48000
+  - `metadata.chunk_frames` *(int)* – e.g., 50
+  - `metadata.chunk_seconds` *(float)* – frames / 25.0
+  - `metadata.crossfade_seconds` *(float)* – typically 0.04
+- `{"type":"chunk_meta","metadata":{…}}` – sent **after** a binary frame when `binary_audio=true`
+- `{"type":"status",…}`, `{"type":"error",…}`, `{"type":"stopped"}`
+
+### Update (client → server)
+```jsonc
+{
+  "type": "update",
+  "styles": "jazz, hiphop",
+  "style_weights": "1.0,0.8",
+  "temperature": 1.2,
+  "topk": 64,
+  "guidance_weight": 1.0,
+  "pace": "realtime",            // optional live flip
+  "max_decode_frames": 40         // optional; <= 50
+}
+```
+
+### Stop / ping
+```json
+{"type":"stop"}
+{"type":"ping"}
+```
+
+### Browser quick‑start (schedules seamlessly with 25–40 ms crossfade)
+```html
+<script>
+const XFADE = 0.025; // 25 ms
+let ctx, gain, ws, nextTime = 0;
+async function start(){
+  ctx = new (window.AudioContext||window.webkitAudioContext)();
+  gain = ctx.createGain(); gain.connect(ctx.destination);
+  ws = new WebSocket("wss://YOUR_SPACE/ws/jam");
+  ws.onopen = ()=> ws.send(JSON.stringify({
+    type:"start", mode:"rt", binary_audio:false,
+    params:{ styles:"warmup", temperature:1.1, topk:40, guidance_weight:1.1, pace:"realtime" }
+  }));
+  ws.onmessage = async ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "chunk" && msg.audio_base64){
+      const bin = atob(msg.audio_base64); const buf = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+      const ab = buf.buffer; const audio = await ctx.decodeAudioData(ab);
+      const src = ctx.createBufferSource(); const g = ctx.createGain();
+      src.buffer = audio; src.connect(g); g.connect(gain);
+      if (nextTime < ctx.currentTime + 0.05) nextTime = ctx.currentTime + 0.12;
+      const startAt = nextTime, dur = audio.duration;
+      nextTime = startAt + Math.max(0, dur - XFADE);
+      g.gain.setValueAtTime(0, startAt);
+      g.gain.linearRampToValueAtTime(1, startAt + XFADE);
+      g.gain.setValueAtTime(1, startAt + Math.max(0, dur - XFADE));
+      g.gain.linearRampToValueAtTime(0, startAt + dur);
+      src.start(startAt);
+    }
+  };
+}
+</script>
+```
+
+### Python client (async)
+```python
+import asyncio, json, websockets, base64, soundfile as sf, io
+async def run(url):
+  async with websockets.connect(url) as ws:
+    await ws.send(json.dumps({"type":"start","mode":"rt","binary_audio":False,
+      "params": {"styles":"warmup","temperature":1.1,"topk":40,"guidance_weight":1.1,"pace":"realtime"}}))
+    while True:
+      msg = json.loads(await ws.recv())
+      if msg.get("type") == "chunk":
+        wav = base64.b64decode(msg["audio_base64"])  # bytes of a WAV
+        x, sr = sf.read(io.BytesIO(wav), dtype="float32")
+        print("chunk", x.shape, sr)
+      elif msg.get("type") in ("stopped","error"): break
+asyncio.run(run("wss://YOUR_SPACE/ws/jam"))
+```
+                    """
+                )
+
+            # ------------------------------------------------------------------
+            # Performance & hardware guidance
+            # ------------------------------------------------------------------
+            with gr.Tab("📊 Performance & Hardware"):
+                gr.Markdown(
+                    r"""
+### Current observations
+- **L40S 48GB** → faster than realtime. Use `pace:"realtime"` to avoid client over‑buffering.
+- **L4 24GB** → slightly **below** realtime even with pre‑roll buffering, TF32/Autotune, smaller chunks (`max_decode_frames`), and the **base** checkpoint.
+
+### Practical guidance
+- For consistent realtime, target **~40GB VRAM per active stream** (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer GPUs).
+- Keep client‑side **overlap‑add** (25–40 ms) for seamless chunk joins.
+- Prefer **`pace:"realtime"`** once playback begins; use **ASAP** only to build a short pre‑roll if needed.
+- Optional knob: **`max_decode_frames`** (default **50** ≈ 2.0 s). Reducing to **36–45** can lower per‑chunk latency/VRAM, but doesn’t increase frames/sec throughput.
+
+### Concurrency
+This research build is designed for **one active jam per GPU**. Concurrency would require GPU partitioning (MIG) or horizontal scaling with a session scheduler.
+                    """
+                )
+
+            # ------------------------------------------------------------------
+            # Changelog & legal
+            # ------------------------------------------------------------------
+            with gr.Tab("🗒️ Changelog & Legal"):
+                gr.Markdown(
+                    r"""
+### Recent changes
+- New **WebSocket realtime** route: `/ws/jam` (`mode:"rt"`)
+- Added server pacing flag: `pace: "realtime" | "asap"`
+- Exposed `max_decode_frames` for shorter chunks on smaller GPUs
+- Client test page now does proper **overlap‑add** crossfade between chunks
+
+### Licensing
+This project uses MagentaRT under:
+- **Code:** Apache 2.0
+- **Model weights:** CC‑BY 4.0
+Please review the MagentaRT repo for full terms.
+                    """
+                )
+
+        gr.Markdown(
+            r"""
+---
+**🔬 Research Project** | **📱 iOS/Web Development** | **🎵 Powered by MagentaRT**
+            """
+        )
+
     return interface
 
 jam_registry: dict[str, JamWorker] = {}
