@@ -35,6 +35,7 @@ class JamParams:
     guidance_weight: float = 1.1
     temperature: float = 1.1
     topk: int = 40
+    style_ramp_seconds: float = 0.0  # 0 => instant (current behavior), try 6.0–10.0 for gentle glides
 
 
 @dataclass
@@ -90,7 +91,11 @@ class JamWorker(threading.Thread):
         self.mrt.topk            = int(self.params.topk)
 
         # style vector (already normalized upstream)
-        self._style_vec = self.params.style_vec
+        self._style_vec = (None if self.params.style_vec is None
+                   else np.array(self.params.style_vec, dtype=np.float32, copy=True))
+        self._chunk_secs = (
+            self.mrt.config.chunk_length_frames * self.mrt.config.frame_length_samples
+        ) / float(self._model_sr)  # ≈ 2.0 s by default
 
         # codec/setup
         self._codec_fps = float(self.mrt.codec.frame_rate)
@@ -124,7 +129,7 @@ class JamWorker(threading.Thread):
 
         # control flags
         self._stop_event = threading.Event()
-        self._max_buffer_ahead = 5
+        self._max_buffer_ahead = 1
 
         # reseed queues (install at next bar boundary after emission)
         self._pending_reseed: Optional[dict] = None           # legacy full reset path (kept for fallback)
@@ -135,6 +140,17 @@ class JamWorker(threading.Thread):
             self._install_context_from_loop(self.params.combined_loop)
 
     # ---------- lifecycle ----------
+
+    def set_buffer_seconds(self, seconds: float):
+        """Clamp how far ahead we allow, in *seconds* of audio."""
+        chunk_secs = float(self.params.bars_per_chunk) * self._bar_clock.seconds_per_bar()
+        max_chunks = max(0, int(round(seconds / max(chunk_secs, 1e-6))))
+        with self._cv:
+            self._max_buffer_ahead = max_chunks
+
+    def set_buffer_chunks(self, k: int):
+        with self._cv:
+            self._max_buffer_ahead = max(0, int(k))
 
     def stop(self):
         self._stop_event.set()
@@ -400,17 +416,6 @@ class JamWorker(threading.Thread):
         # also remember this as new "original"
         self._original_context_tokens = np.copy(context_tokens)
 
-    def reseed_splice(self, recent_wav: au.Waveform, anchor_bars: float):
-        """Queue a splice reseed to be applied right after the next emitted loop.
-        For now, we simply replace the context by recent wave tail; anchor is accepted
-        for API compatibility and future crossfade/token-splice logic."""
-        recent_wav = recent_wav.as_stereo().resample(self._model_sr)
-        tail = take_bar_aligned_tail(recent_wav, self.params.bpm, self.params.beats_per_bar, self._ctx_seconds)
-        tokens_full = self.mrt.codec.encode(tail).astype(np.int32)
-        depth = int(self.mrt.config.decoder_codec_rvq_depth)
-        new_ctx = tokens_full[:, :depth]
-        self._pending_reseed = {"ctx": new_ctx}
-
     # ---------- core streaming helpers ----------
 
     def _append_model_chunk_and_spool(self, wav: au.Waveform):
@@ -538,8 +543,20 @@ class JamWorker(threading.Thread):
             # generate next model chunk
             # snapshot current style vector under lock for this step
             with self._lock:
-                style_vec = self.params.style_vec
-            wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_vec)
+                target = self.params.style_vec
+                if target is None:
+                    style_to_use = None
+                else:
+                    if self._style_vec is None:  # first use: start exactly at initial style (no glide)
+                        self._style_vec = np.array(target, dtype=np.float32, copy=True)
+                    else:
+                        ramp = float(self.params.style_ramp_seconds or 0.0)
+                        step = 1.0 if ramp <= 0.0 else min(1.0, self._chunk_secs / ramp)
+                        # linear ramp in embedding space
+                        self._style_vec += step * (target.astype(np.float32, copy=False) - self._style_vec)
+                    style_to_use = self._style_vec
+
+            wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_to_use)
             # append and spool
             self._append_model_chunk_and_spool(wav)
             # try emitting zero or more chunks if available

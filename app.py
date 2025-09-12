@@ -1602,7 +1602,9 @@ async def ws_jam(websocket: WebSocket):
                         # Stash rt session fields
                         websocket._mrt   = mrt
                         websocket._state = state
-                        websocket._style = style_vec
+                        websocket._style_cur = style_vec
+                        websocket._style_tgt = style_vec
+                        websocket._style_ramp_s = float(params.get("style_ramp_seconds", 0.0))
 
                         websocket._rt_mean              = mean_w
                         websocket._rt_centroid_weights  = cw
@@ -1628,7 +1630,15 @@ async def ws_jam(websocket: WebSocket):
                                     mrt.temperature     = websocket._rt_temp
                                     mrt.topk            = websocket._rt_topk
 
-                                    wav, new_state = mrt.generate_chunk(state=websocket._state, style=websocket._style)
+                                    # ramp style
+                                    ramp = float(getattr(websocket, "_style_ramp_s", 0.0) or 0.0)
+                                    if ramp <= 0.0:
+                                        websocket._style_cur = websocket._style_tgt
+                                    else:
+                                        step = min(1.0, chunk_secs / ramp)
+                                        websocket._style_cur = websocket._style_cur + step * (websocket._style_tgt - websocket._style_cur)
+
+                                    wav, new_state = mrt.generate_chunk(state=websocket._state, style=websocket._style_cur)
                                     websocket._state = new_state
 
                                     x = wav.samples.astype(np.float32, copy=False)
@@ -1726,8 +1736,7 @@ async def ws_jam(websocket: WebSocket):
                     text_w = [float(x) for x in style_weights_str.split(",")] if style_weights_str else []
 
                     _ensure_assets_loaded()
-                    # build final style vec (no loop embedding in rt-mode)
-                    websocket._style = build_style_vector(
+                    websocket._style_tgt = build_style_vector(
                         websocket._mrt,
                         text_styles=text_list,
                         text_weights=text_w,
@@ -1736,6 +1745,10 @@ async def ws_jam(websocket: WebSocket):
                         mean_weight=float(websocket._rt_mean),
                         centroid_weights=websocket._rt_centroid_weights,
                     )
+                    # optionally allow live changes to ramp:
+                    if "style_ramp_seconds" in msg:
+                        try: websocket._style_ramp_s = float(msg["style_ramp_seconds"])
+                        except: pass
                     await send_json({"type":"status","updated":"rt-knobs+style"})
 
             elif mtype == "consume" and mode == "bar":
