@@ -90,12 +90,7 @@ class JamWorker(threading.Thread):
         self.mrt.temperature     = float(self.params.temperature)
         self.mrt.topk            = int(self.params.topk)
 
-        # style vector (already normalized upstream)
-        self._style_vec = (None if self.params.style_vec is None
-                   else np.array(self.params.style_vec, dtype=np.float32, copy=True))
-        self._chunk_secs = (
-            self.mrt.config.chunk_length_frames * self.mrt.config.frame_length_samples
-        ) / float(self._model_sr)  # ≈ 2.0 s by default
+        
 
         # codec/setup
         self._codec_fps = float(self.mrt.codec.frame_rate)
@@ -106,6 +101,13 @@ class JamWorker(threading.Thread):
         # model stream (model SR) for internal continuity/crossfades
         self._model_stream: Optional[np.ndarray] = None
         self._model_sr = int(self.mrt.sample_rate)
+
+        # style vector (already normalized upstream)
+        self._style_vec = (None if self.params.style_vec is None
+                   else np.array(self.params.style_vec, dtype=np.float32, copy=True))
+        self._chunk_secs = (
+            self.mrt.config.chunk_length_frames * self.mrt.config.frame_length_samples
+        ) / float(self._model_sr)  # ≈ 2.0 s by default
 
         # target-SR in-RAM spool (what we cut loops from)
         if int(self.params.target_sr) != int(self._model_sr):
