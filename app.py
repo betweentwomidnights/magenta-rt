@@ -94,7 +94,7 @@ def _resolve_checkpoint_dir() -> str | None:
         revision=os.getenv("MRT_CKPT_REV", "main"),
         local_dir="/home/appuser/.cache/mrt_ckpt/repo",
         local_dir_use_symlinks=False,
-        allow_patterns=allow or ["*"],  # whole repo if no step provided
+        # <- no allow_patterns, we grab everything to avoid dotfile issues
     )
     root = Path(local)
 
