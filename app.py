@@ -66,6 +66,51 @@ except Exception:
     class ClientDisconnected(Exception):  # fallback
         pass
 
+import re
+from pathlib import Path
+
+def _resolve_checkpoint_dir() -> str | None:
+    """
+    Returns a local directory path for MagentaRT(checkpoint_dir=...),
+    using a Hugging Face model repo that contains subfolders like:
+      checkpoint_1861001/, checkpoint_1862001/, ...
+    """
+    repo_id = os.getenv("MRT_CKPT_REPO")
+    if not repo_id:
+        return None  # fall back to builtin 'base'/'large' assets
+
+    step = os.getenv("MRT_CKPT_STEP")  # e.g., "1863001"
+    allow = None
+    if step:
+        # only pull that step + optional centroid files
+        allow = [f"checkpoint_{step}/**", "cluster_centroids.npy", "mean_style_embed.npy"]
+
+    from huggingface_hub import snapshot_download
+    local = snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        local_dir="/home/appuser/.cache/mrt_ckpt/repo",
+        local_dir_use_symlinks=False,
+        allow_patterns=allow or ["*"],  # whole repo if no step provided
+    )
+    root = Path(local)
+
+    # If a step is specified, return that subfolder
+    if step:
+        cand = root / f"checkpoint_{step}"
+        if cand.is_dir():
+            return str(cand)
+
+    # Otherwise pick the numerically latest checkpoint_* folder
+    step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
+    if step_dirs:
+        pick = max(step_dirs, key=lambda d: int(d.name.split("_")[-1]))
+        return str(pick)
+
+    # Fallback: repo itself might already be a single checkpoint directory
+    return str(root)
+
+
 async def send_json_safe(ws: WebSocket, obj) -> bool:
     """Try to send. Returns False if the socket is (or becomes) closed."""
     if ws.client_state == WebSocketState.DISCONNECTED or ws.application_state == WebSocketState.DISCONNECTED:
@@ -569,7 +614,14 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                _MRT = system.MagentaRT(tag="large", guidance_weight=5.0, device="gpu", lazy=False)
+                ckpt_dir = _resolve_checkpoint_dir()  # ← points to checkpoint_1863001
+                _MRT = system.MagentaRT(
+                    tag=os.getenv("MRT_SIZE", "large"),  # keep 'large' if finetuned from large
+                    guidance_weight=5.0,
+                    device="gpu",
+                    checkpoint_dir=ckpt_dir,             # ← uses your finetune
+                    lazy=False,
+                )
     return _MRT
 
 _WARMED = False
@@ -647,6 +699,31 @@ def _mrt_warmup():
 def _kickoff_warmup():
     if os.getenv("MRT_WARMUP", "1") != "0":
         threading.Thread(target=_mrt_warmup, name="mrt-warmup", daemon=True).start()
+
+@app.get("/model/status")
+def model_status():
+    mrt = get_mrt()
+    return {
+        "tag": getattr(mrt, "_tag", "unknown"),
+        "using_checkpoint_dir": True,
+        "codec_frame_rate": float(mrt.codec.frame_rate),
+        "decoder_rvq_depth": int(mrt.config.decoder_codec_rvq_depth),
+        "context_seconds": float(mrt.config.context_length),
+        "chunk_seconds": float(mrt.config.chunk_length),
+        "crossfade_seconds": float(mrt.config.crossfade_length),
+        "selected_step": os.getenv("MRT_CKPT_STEP"),
+        "repo": os.getenv("MRT_CKPT_REPO"),
+    }
+
+@app.post("/model/swap")
+def model_swap(step: int = Form(...)):
+    # stop any active jam if you want to be strict (not shown)
+    os.environ["MRT_CKPT_STEP"] = str(step)
+    global _MRT
+    with _MRT_LOCK:
+        _MRT = None  # force re-create on next get_mrt()
+    # optionally pre-warm here by calling get_mrt()
+    return {"reloaded": True, "step": step}
 
 @app.post("/generate")
 def generate(
