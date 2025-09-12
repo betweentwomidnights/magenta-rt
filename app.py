@@ -66,59 +66,69 @@ except Exception:
     class ClientDisconnected(Exception):  # fallback
         pass
 
-import re
+import re, tarfile
 from pathlib import Path
+from huggingface_hub import snapshot_download
 
 def _resolve_checkpoint_dir() -> str | None:
     repo_id = os.getenv("MRT_CKPT_REPO")
     if not repo_id:
         return None
+    step = os.getenv("MRT_CKPT_STEP")  # e.g. "1863001"
 
-    step = os.getenv("MRT_CKPT_STEP")  # e.g., "1863001"
-
-    from huggingface_hub import snapshot_download
-    allow = None
-    if step:
-        base = f"checkpoint_{step}"
-        # include everything under the step *including dotfiles*
-        allow = [
-            f"{base}/**",          # all regular files
-            f"{base}/**/.*",       # dotfiles like .zarray / .zattrs
-            f"{base}/**/.zarray",
-            f"{base}/**/.zattrs",
-        ]
-
-    local = snapshot_download(
+    root = Path(snapshot_download(
         repo_id=repo_id,
         repo_type="model",
         revision=os.getenv("MRT_CKPT_REV", "main"),
         local_dir="/home/appuser/.cache/mrt_ckpt/repo",
         local_dir_use_symlinks=False,
-        # <- no allow_patterns, we grab everything to avoid dotfile issues
-    )
-    root = Path(local)
+    ))
 
+    # Prefer an archive if present (more reliable for Zarr/T5X)
+    arch_names = [
+        f"checkpoint_{step}.tgz",
+        f"checkpoint_{step}.tar.gz",
+        f"archives/checkpoint_{step}.tgz",
+        f"archives/checkpoint_{step}.tar.gz",
+    ] if step else []
+
+    cache_root = Path("/home/appuser/.cache/mrt_ckpt/extracted")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    for name in arch_names:
+        arch = root / name
+        if arch.is_file():
+            out_dir = cache_root / f"checkpoint_{step}"
+            marker = out_dir.with_suffix(".ok")
+            if not marker.exists():
+                out_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(arch, "r:*") as tf:
+                    tf.extractall(out_dir)
+                marker.write_text("ok")
+            # sanity: require .zarray to exist inside the extracted tree
+            if not any(out_dir.rglob(".zarray")):
+                raise RuntimeError(f"Extracted archive missing .zarray files: {out_dir}")
+            return str(out_dir / f"checkpoint_{step}") if (out_dir / f"checkpoint_{step}").exists() else str(out_dir)
+
+    # No archive; try raw folder from repo and sanity check.
     if step:
-        step_dir = root / f"checkpoint_{step}"
-        # sanity check: make sure dotfiles arrived
-        if not any(step_dir.rglob(".zarray")):
-            raise RuntimeError(
-                f"Checkpoint appears incomplete (no .zarray files under {step_dir}). "
-                "Ensure allow_patterns includes dotfiles or re-upload preserving dotfiles."
-            )
-        return str(step_dir)
+        raw = root / f"checkpoint_{step}"
+        if raw.is_dir():
+            if not any(raw.rglob(".zarray")):
+                raise RuntimeError(
+                    f"Downloaded checkpoint_{step} appears incomplete (no .zarray). "
+                    "Upload as a .tgz or push via git from a Unix shell."
+                )
+            return str(raw)
 
-    # otherwise pick latest checkpoint_* directory
+    # Pick latest if no step
     step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
     if step_dirs:
         pick = max(step_dirs, key=lambda d: int(d.name.split('_')[-1]))
         if not any(pick.rglob(".zarray")):
-            raise RuntimeError(
-                f"Checkpoint appears incomplete (no .zarray files under {pick})."
-            )
+            raise RuntimeError(f"Downloaded {pick} appears incomplete (no .zarray).")
         return str(pick)
 
-    return str(root)
+    return None
 
 
 async def send_json_safe(ws: WebSocket, obj) -> bool:
