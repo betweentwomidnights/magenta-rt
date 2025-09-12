@@ -32,7 +32,7 @@ except Exception:
 
 from magenta_rt import system, audio as au
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
@@ -69,6 +69,78 @@ except Exception:
 import re, tarfile
 from pathlib import Path
 from huggingface_hub import snapshot_download
+
+# ---- Finetune assets (mean & centroids) --------------------------------------
+_FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
+_ASSETS_REPO_ID: str | None = None
+_MEAN_EMBED: np.ndarray | None = None           # shape (D,) dtype float32
+_CENTROIDS: np.ndarray | None = None            # shape (K, D) dtype float32
+
+def _load_finetune_assets_from_hf(repo_id: str | None) -> tuple[bool, str]:
+    """
+    Download & load mean_style_embed.npy and cluster_centroids.npy from a HF model repo.
+    Safe to call multiple times; will overwrite globals if successful.
+    """
+    global _ASSETS_REPO_ID, _MEAN_EMBED, _CENTROIDS
+    repo_id = repo_id or _FINETUNE_REPO_DEFAULT
+    try:
+        from huggingface_hub import hf_hub_download
+        mean_path = None
+        cent_path = None
+        try:
+            mean_path = hf_hub_download(repo_id, filename="mean_style_embed.npy", repo_type="model")
+        except Exception:
+            pass
+        try:
+            cent_path = hf_hub_download(repo_id, filename="cluster_centroids.npy", repo_type="model")
+        except Exception:
+            pass
+
+        if mean_path is None and cent_path is None:
+            return False, f"No finetune asset files found in repo {repo_id}"
+
+        if mean_path is not None:
+            m = np.load(mean_path)
+            if m.ndim != 1:
+                return False, f"mean_style_embed.npy must be 1-D (got {m.shape})"
+        else:
+            m = None
+
+        if cent_path is not None:
+            c = np.load(cent_path)
+            if c.ndim != 2:
+                return False, f"cluster_centroids.npy must be 2-D (got {c.shape})"
+        else:
+            c = None
+
+        # Optional: shape check vs model embedding dim once model is alive
+        try:
+            d = int(get_mrt().style_model.config.embedding_dim)
+            if m is not None and m.shape[0] != d:
+                return False, f"mean_style_embed dim {m.shape[0]} != model dim {d}"
+            if c is not None and c.shape[1] != d:
+                return False, f"cluster_centroids dim {c.shape[1]} != model dim {d}"
+        except Exception:
+            # Model not built yet; we’ll trust the files and rely on runtime checks later
+            pass
+
+        _MEAN_EMBED = m.astype(np.float32, copy=False) if m is not None else None
+        _CENTROIDS = c.astype(np.float32, copy=False) if c is not None else None
+        _ASSETS_REPO_ID = repo_id
+        logging.info("Loaded finetune assets from %s (mean=%s, centroids=%s)",
+                     repo_id,
+                     "yes" if _MEAN_EMBED is not None else "no",
+                     f"{_CENTROIDS.shape[0]}x{_CENTROIDS.shape[1]}" if _CENTROIDS is not None else "no")
+        return True, "ok"
+    except Exception as e:
+        logging.exception("Failed to load finetune assets: %s", e)
+        return False, str(e)
+
+def _ensure_assets_loaded():
+    # Best-effort lazy load if nothing is loaded yet
+    if _MEAN_EMBED is None and _CENTROIDS is None:
+        _load_finetune_assets_from_hf(_ASSETS_REPO_ID or _FINETUNE_REPO_DEFAULT)
+# ------------------------------------------------------------------------------
 
 def _resolve_checkpoint_dir() -> str | None:
     repo_id = os.getenv("MRT_CKPT_REPO")
@@ -540,6 +612,9 @@ def generate_loop_continuation_with_mrt(
 
     return out, loud_stats
 
+# untested.
+# not sure how it will retain the input bpm. we may want to use a metronome instead of silence. i think google might do that.
+# does a generation with silent context rather than a combined loop
 def generate_style_only_with_mrt(
     mrt,
     bpm: float,
@@ -610,6 +685,92 @@ def generate_style_only_with_mrt(
 
     return out, None  # loudness stats not applicable (no reference)
 
+def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
+    extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
+    if not extra:
+        return mrt.embed_style("warmup")
+    sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
+    embeds, weights = [], []
+    for i, s in enumerate(extra):
+        embeds.append(mrt.embed_style(s))
+        weights.append(sw[i] if i < len(sw) else 1.0)
+    wsum = sum(weights) or 1.0
+    weights = [w/wsum for w in weights]
+    import numpy as np
+    return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
+def build_style_vector(
+    mrt,
+    *,
+    text_styles: list[str] | None = None,
+    text_weights: list[float] | None = None,
+    loop_embed: np.ndarray | None = None,
+    loop_weight: float | None = None,
+    mean_weight: float | None = None,
+    centroid_weights: list[float] | None = None,
+) -> np.ndarray:
+    """
+    Returns a single style embedding combining:
+      - loop embedding (optional)
+      - one or more text style embeddings (optional)
+      - mean finetune embedding (optional)
+      - centroid embeddings (optional)
+    All weights are normalized so they sum to 1 if > 0.
+    """
+    comps: list[np.ndarray] = []
+    weights: list[float] = []
+
+    # loop component
+    if loop_embed is not None and (loop_weight or 0) > 0:
+        comps.append(loop_embed.astype(np.float32, copy=False))
+        weights.append(float(loop_weight))
+
+    # text components
+    if text_styles:
+        for i, s in enumerate(text_styles):
+            s = s.strip()
+            if not s:
+                continue
+            w = 1.0
+            if text_weights and i < len(text_weights):
+                try: w = float(text_weights[i])
+                except: w = 1.0
+            if w <= 0: 
+                continue
+            e = mrt.embed_style(s)
+            comps.append(e.astype(np.float32, copy=False))
+            weights.append(w)
+
+    # mean finetune
+    if mean_weight and (_MEAN_EMBED is not None) and mean_weight > 0:
+        comps.append(_MEAN_EMBED)
+        weights.append(float(mean_weight))
+
+    # centroid components
+    if centroid_weights and _CENTROIDS is not None:
+        K = _CENTROIDS.shape[0]
+        for k, w in enumerate(centroid_weights[:K]):
+            try: w = float(w)
+            except: w = 0.0
+            if w <= 0: 
+                continue
+            comps.append(_CENTROIDS[k])
+            weights.append(w)
+
+    if not comps:
+        # fallback: neutral style if nothing provided
+        return mrt.embed_style("")
+
+    wsum = sum(weights)
+    if wsum <= 0:
+        return mrt.embed_style("")
+    weights = [w/wsum for w in weights]
+
+    # weighted sum
+    out = np.zeros_like(comps[0], dtype=np.float32)
+    for w, e in zip(weights, comps):
+        out += w * e.astype(np.float32, copy=False)
+    return out
 
 
 
@@ -669,7 +830,6 @@ def _mrt_warmup():
             beats_per_bar = 4
 
             # --- build a silent, stereo context of ctx_seconds ---
-            import numpy as np, soundfile as sf
             samples = int(max(1, round(ctx_seconds * sr)))
             silent = np.zeros((samples, 2), dtype=np.float32)
 
@@ -744,6 +904,28 @@ def model_swap(step: int = Form(...)):
         _MRT = None  # force re-create on next get_mrt()
     # optionally pre-warm here by calling get_mrt()
     return {"reloaded": True, "step": step}
+
+@app.post("/model/assets/load")
+def model_assets_load(repo_id: str = Form(None)):
+    ok, msg = _load_finetune_assets_from_hf(repo_id)
+    return {"ok": ok, "message": msg, "repo_id": _ASSETS_REPO_ID,
+            "mean": _MEAN_EMBED is not None,
+            "centroids": None if _CENTROIDS is None else int(_CENTROIDS.shape[0])}
+
+@app.get("/model/assets/status")
+def model_assets_status():
+    d = None
+    try:
+        d = int(get_mrt().style_model.config.embedding_dim)
+    except Exception:
+        pass
+    return {
+        "repo_id": _ASSETS_REPO_ID,
+        "mean_loaded": _MEAN_EMBED is not None,
+        "centroids_loaded": False if _CENTROIDS is None else True,
+        "centroid_count": None if _CENTROIDS is None else int(_CENTROIDS.shape[0]),
+        "embedding_dim": d,
+    }
 
 @app.post("/generate")
 def generate(
@@ -911,6 +1093,11 @@ def jam_start(
     styles: str = Form(""),
     style_weights: str = Form(""),
     loop_weight: float = Form(1.0),
+
+    # NEW steering params:
+    mean: float = Form(0.0),
+    centroid_weights: str = Form(""),
+
     loudness_mode: str = Form("auto"),
     loudness_headroom_db: float = Form(1.0),
     guidance_weight: float = Form(1.1),
@@ -918,6 +1105,8 @@ def jam_start(
     topk: int = Form(40),
     target_sample_rate: int | None = Form(None),
 ):
+    _ensure_assets_loaded()
+
     # enforce single active jam per GPU
     with jam_lock:
         for sid, w in list(jam_registry.items()):
@@ -938,16 +1127,32 @@ def jam_start(
     ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
     loop_tail = take_bar_aligned_tail(loop, bpm, beats_per_bar, ctx_seconds)
 
-    # style vec = normalized mix of loop_tail + extra styles
-    embeds, weights = [mrt.embed_style(loop_tail)], [float(loop_weight)]
-    extra = [s for s in (styles.split(",") if styles else []) if s.strip()]
-    sw = [float(x) for x in style_weights.split(",")] if style_weights else []
-    for i, s in enumerate(extra):
-        embeds.append(mrt.embed_style(s.strip()))
-        weights.append(sw[i] if i < len(sw) else 1.0)
-    wsum = sum(weights) or 1.0
-    weights = [w / wsum for w in weights]
-    style_vec = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(embeds[0].dtype)
+    # Parse client style fields (preserves your semantics)
+    text_list = [s.strip() for s in (styles.split(",") if styles else []) if s.strip()]
+    try:
+        tw = [float(x) for x in style_weights.split(",")] if style_weights else []
+    except ValueError:
+        tw = []
+    try:
+        cw = [float(x) for x in centroid_weights.split(",")] if centroid_weights else []
+    except ValueError:
+        cw = []
+
+    # Compute loop-tail embed once (same as before)
+    loop_tail_embed = mrt.embed_style(loop_tail)
+
+    # Build final style vector:
+    # - identical to your previous mix when mean==0 and cw is empty
+    # - otherwise includes mean and centroid components (weights auto-normalized)
+    style_vec = build_style_vector(
+        mrt,
+        text_styles=text_list,
+        text_weights=tw,
+        loop_embed=loop_tail_embed,
+        loop_weight=float(loop_weight),
+        mean_weight=float(mean),
+        centroid_weights=cw,
+    ).astype(np.float32, copy=False)
 
     # target SR (default input SR)
     inp_info = sf.info(tmp_path)
@@ -1036,27 +1241,33 @@ def jam_stop(session_id: str = Body(..., embed=True)):
         jam_registry.pop(session_id, None)
     return {"stopped": True}
 
-@app.post("/jam/update")  # consolidated
+@app.post("/jam/update")
 def jam_update(
     session_id: str = Form(...),
 
-    # knobs (all optional)
+    # knobs
     guidance_weight: Optional[float] = Form(None),
     temperature: Optional[float]     = Form(None),
     topk: Optional[int]              = Form(None),
 
-    # styles (all optional)
+    # styles
     styles: str                      = Form(""),
     style_weights: str               = Form(""),
-    loop_weight: Optional[float]     = Form(None),   # None means "don’t change"
+    loop_weight: Optional[float]     = Form(None),
     use_current_mix_as_style: bool   = Form(False),
+
+    # NEW steering
+    mean: Optional[float]            = Form(None),
+    centroid_weights: str            = Form(""),
 ):
+    _ensure_assets_loaded()
+
     with jam_lock:
         worker = jam_registry.get(session_id)
     if worker is None or not worker.is_alive():
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # --- 1) Apply knob updates (atomic under lock)
+    # 1) fast knob updates
     if any(v is not None for v in (guidance_weight, temperature, topk)):
         worker.update_knobs(
             guidance_weight=guidance_weight,
@@ -1064,34 +1275,61 @@ def jam_update(
             topk=topk
         )
 
-    # --- 2) Apply style updates only if requested
-    wants_style_update = use_current_mix_as_style or (styles.strip() != "")
-    if wants_style_update:
-        embeds, weights = [], []
+    # 2) rebuild style only if asked
+    wants_style_update = (
+        use_current_mix_as_style
+        or (styles.strip() != "")
+        or (mean is not None)
+        or (centroid_weights.strip() != "")
+    )
+    if not wants_style_update:
+        return {"ok": True}
 
-        # optional: include current mix as a style component
-        if use_current_mix_as_style and worker.params.combined_loop is not None:
-            lw = 1.0 if loop_weight is None else float(loop_weight)
-            embeds.append(worker.mrt.embed_style(worker.params.combined_loop))
-            weights.append(lw)
+    # --- parse inputs (robust) ---
+    text_list = [s.strip() for s in (styles.split(",") if styles else []) if s.strip()]
+    try:
+        tw = [float(x) for x in style_weights.split(",")] if style_weights else []
+    except ValueError:
+        tw = []
+    try:
+        cw = [float(x) for x in centroid_weights.split(",")] if centroid_weights else []
+    except ValueError:
+        cw = []
 
-        # extra text styles
-        extra = [s for s in (styles.split(",") if styles else []) if s.strip()]
-        sw = [float(x) for x in style_weights.split(",")] if style_weights else []
-        for i, s in enumerate(extra):
-            embeds.append(worker.mrt.embed_style(s.strip()))
-            weights.append(sw[i] if i < len(sw) else 1.0)
+    # Clamp centroid weights to available centroids (if loaded)
+    max_c = 0 if _CENTROIDS is None else int(_CENTROIDS.shape[0])
+    if max_c and len(cw) > max_c:
+        cw = cw[:max_c]
 
-        if embeds:  # only swap if we actually built something
-            wsum = sum(weights) or 1.0
-            weights = [w / wsum for w in weights]
-            style_vec = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+    # Snapshot minimal state under lock
+    with worker._lock:
+        combined_loop = worker.params.combined_loop if use_current_mix_as_style else None
+        lw = None
+        if use_current_mix_as_style:
+            lw = 1.0 if (loop_weight is None) else float(loop_weight)
+        mrt = worker.mrt
 
-            # install atomically
-            with worker._lock:
-                worker.params.style_vec = style_vec
+    # Heavy work OUTSIDE the lock
+    loop_embed = None
+    if combined_loop is not None:
+        loop_embed = mrt.embed_style(combined_loop)
+
+    style_vec = build_style_vector(
+        mrt,
+        text_styles=text_list,
+        text_weights=tw,
+        loop_embed=loop_embed,             # None => ignored by builder
+        loop_weight=lw,                    # None => ignored by builder
+        mean_weight=(None if mean is None else float(mean)),
+        centroid_weights=cw,               # [] => ignored by builder
+    ).astype(np.float32, copy=False)
+
+    # Swap atomically
+    with worker._lock:
+        worker.params.style_vec = style_vec
 
     return {"ok": True}
+
 
 @app.post("/jam/reseed")
 def jam_reseed(session_id: str = Form(...), loop_audio: UploadFile = File(None)):
@@ -1217,21 +1455,6 @@ async def log_requests(request: Request, call_next):
 # ----------------------------
 
 
-
-def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
-    extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
-    if not extra:
-        return mrt.embed_style("warmup")
-    sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
-    embeds, weights = [], []
-    for i, s in enumerate(extra):
-        embeds.append(mrt.embed_style(s))
-        weights.append(sw[i] if i < len(sw) else 1.0)
-    wsum = sum(weights) or 1.0
-    weights = [w/wsum for w in weights]
-    import numpy as np
-    return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
-
 @app.websocket("/ws/jam")
 async def ws_jam(websocket: WebSocket):
     await websocket.accept()
@@ -1253,7 +1476,7 @@ async def ws_jam(websocket: WebSocket):
             # --- START ---
             if mtype == "start":
                 binary_audio = bool(msg.get("binary_audio", False))
-                mode = msg.get("mode", "bar")
+                mode = msg.get("mode", "rt")
                 params = msg.get("params", {}) or {}
                 sid = msg.get("session_id")
 
@@ -1332,37 +1555,75 @@ async def ws_jam(websocket: WebSocket):
 
                     else:
                         # mode == "rt" (Colab-style, no loop context)
-                        # seed a fresh state with a silent context like warmup
                         mrt = get_mrt()
                         state = mrt.init_state()
-                        codec_fps = float(mrt.codec.frame_rate)
+
+                        # Build silent context (10s) tokens
+                        codec_fps   = float(mrt.codec.frame_rate)
                         ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
                         sr = int(mrt.sample_rate)
                         samples = int(max(1, round(ctx_seconds * sr)))
-                        silent = au.Waveform(np.zeros((samples,2), np.float32), sr)
+                        silent = au.Waveform(np.zeros((samples, 2), np.float32), sr)
                         tokens = mrt.codec.encode(silent).astype(np.int32)[:, :mrt.config.decoder_codec_rvq_depth]
                         state.context_tokens = tokens
 
-                        websocket._mrt = mrt
+                        # Parse params (including steering)
+                        _ensure_assets_loaded()
+                        styles_str        = params.get("styles", "warmup") or ""
+                        style_weights_str = params.get("style_weights", "") or ""
+                        mean_w            = float(params.get("mean", 0.0) or 0.0)
+                        cw_str            = str(params.get("centroid_weights", "") or "")
+
+                        text_list = [s.strip() for s in styles_str.split(",") if s.strip()]
+                        try:
+                            text_w = [float(x) for x in style_weights_str.split(",")] if style_weights_str else []
+                        except ValueError:
+                            text_w = []
+                        try:
+                            cw = [float(x) for x in cw_str.split(",") if x.strip() != ""]
+                        except ValueError:
+                            cw = []
+
+                        # Clamp centroid weights to available centroids
+                        if _CENTROIDS is not None and len(cw) > int(_CENTROIDS.shape[0]):
+                            cw = cw[: int(_CENTROIDS.shape[0])]
+
+                        # Build initial style vector (no loop_embed in rt mode)
+                        style_vec = build_style_vector(
+                            mrt,
+                            text_styles=text_list,
+                            text_weights=text_w,
+                            loop_embed=None,
+                            loop_weight=None,
+                            mean_weight=mean_w,
+                            centroid_weights=cw,
+                        )
+
+                        # Stash rt session fields
+                        websocket._mrt   = mrt
                         websocket._state = state
-                        websocket._style = _combine_styles(mrt,
-                                                        params.get("styles","warmup"),
-                                                        params.get("style_weights",""))
-                        websocket._rt_running = True
-                        websocket._rt_sr = sr
-                        websocket._rt_topk = int(params.get("topk", 40))
-                        websocket._rt_temp = float(params.get("temperature", 1.1))
-                        websocket._rt_guid = float(params.get("guidance_weight", 1.1))
-                        websocket._pace = params.get("pace", "asap")  # "realtime" | "asap"
-                        await send_json({"type":"started","mode":"rt"})
-                        # kick off a background task to stream ~2s chunks
+                        websocket._style = style_vec
+
+                        websocket._rt_mean              = mean_w
+                        websocket._rt_centroid_weights  = cw
+                        websocket._rt_running           = True
+                        websocket._rt_sr                = sr
+                        websocket._rt_topk              = int(params.get("topk", 40))
+                        websocket._rt_temp              = float(params.get("temperature", 1.1))
+                        websocket._rt_guid              = float(params.get("guidance_weight", 1.1))
+                        websocket._pace                 = params.get("pace", "asap")  # "realtime" | "asap"
+
+                        # (Optional) report whether steering assets were loaded
+                        assets_ok = (_MEAN_EMBED is not None) or (_CENTROIDS is not None)
+                        await send_json({"type": "started", "mode": "rt", "steering_assets": "loaded" if assets_ok else "none"})
+
+                        # kick off the ~2s streaming loop
                         async def _rt_loop():
                             try:
                                 mrt = websocket._mrt
                                 chunk_secs = (mrt.config.chunk_length_frames * mrt.config.frame_length_samples) / float(mrt.sample_rate)
                                 target_next = time.perf_counter()
                                 while websocket._rt_running:
-                                    # read knobs (already set by update)
                                     mrt.guidance_weight = websocket._rt_guid
                                     mrt.temperature     = websocket._rt_temp
                                     mrt.topk            = websocket._rt_topk
@@ -1374,37 +1635,32 @@ async def ws_jam(websocket: WebSocket):
                                     buf = io.BytesIO()
                                     sf.write(buf, x, mrt.sample_rate, subtype="FLOAT", format="WAV")
 
-                                    # send bytes / json best-effort
                                     ok = True
                                     if binary_audio:
                                         try:
                                             await websocket.send_bytes(buf.getvalue())
-                                            ok = await send_json({"type":"chunk_meta","metadata":{"sample_rate":mrt.sample_rate}})
+                                            ok = await send_json({"type": "chunk_meta", "metadata": {"sample_rate": mrt.sample_rate}})
                                         except Exception:
                                             ok = False
                                     else:
                                         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                                        ok = await send_json({"type":"chunk","audio_base64":b64,
-                                                            "metadata":{"sample_rate":mrt.sample_rate}})
+                                        ok = await send_json({"type": "chunk", "audio_base64": b64,
+                                                            "metadata": {"sample_rate": mrt.sample_rate}})
 
                                     if not ok:
-                                        # client went away — exit cleanly
                                         break
 
-                                    # pacing (use captured flag from start)
                                     if getattr(websocket, "_pace", "asap") == "realtime":
                                         t1 = time.perf_counter()
                                         target_next += chunk_secs
                                         sleep_s = max(0.0, target_next - t1 - 0.02)
                                         if sleep_s > 0:
                                             await asyncio.sleep(sleep_s)
-
                             except asyncio.CancelledError:
-                                # normal on stop/close — just exit
                                 pass
                             except Exception:
-                                # don't try to send an error; socket may be closed
                                 pass
+
                         websocket._rt_task = asyncio.create_task(_rt_loop())
                         continue  # skip the “bar-mode started” message below
 
@@ -1450,13 +1706,37 @@ async def ws_jam(websocket: WebSocket):
                     websocket._rt_topk = int(msg.get("topk", websocket._rt_topk))
                     websocket._rt_guid = float(msg.get("guidance_weight", websocket._rt_guid))
 
-                    if ("styles" in msg) or ("style_weights" in msg):
-                        websocket._style = _combine_styles(
-                            websocket._mrt,
-                            msg.get("styles", ""),
-                            msg.get("style_weights", "")
-                        )
-                    await send_json({"type":"status","updated":"rt-knobs"})
+                    # NEW steering fields
+                    if "mean" in msg and msg["mean"] is not None:
+                        try: websocket._rt_mean = float(msg["mean"])
+                        except: websocket._rt_mean = 0.0
+
+                    if "centroid_weights" in msg:
+                        cw = [w.strip() for w in str(msg["centroid_weights"]).split(",") if w.strip() != ""]
+                        try:
+                            websocket._rt_centroid_weights = [float(x) for x in cw]
+                        except:
+                            websocket._rt_centroid_weights = []
+
+                    # styles / text weights (optional, comma-separated)
+                    styles_str = msg.get("styles", None)
+                    style_weights_str = msg.get("style_weights", "")
+
+                    text_list = [s for s in (styles_str.split(",") if styles_str else []) if s.strip()]
+                    text_w = [float(x) for x in style_weights_str.split(",")] if style_weights_str else []
+
+                    _ensure_assets_loaded()
+                    # build final style vec (no loop embedding in rt-mode)
+                    websocket._style = build_style_vector(
+                        websocket._mrt,
+                        text_styles=text_list,
+                        text_weights=text_w,
+                        loop_embed=None,
+                        loop_weight=None,
+                        mean_weight=float(websocket._rt_mean),
+                        centroid_weights=websocket._rt_centroid_weights,
+                    )
+                    await send_json({"type":"status","updated":"rt-knobs+style"})
 
             elif mtype == "consume" and mode == "bar":
                 with jam_lock:
