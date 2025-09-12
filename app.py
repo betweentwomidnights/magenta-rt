@@ -70,44 +70,54 @@ import re
 from pathlib import Path
 
 def _resolve_checkpoint_dir() -> str | None:
-    """
-    Returns a local directory path for MagentaRT(checkpoint_dir=...),
-    using a Hugging Face model repo that contains subfolders like:
-      checkpoint_1861001/, checkpoint_1862001/, ...
-    """
     repo_id = os.getenv("MRT_CKPT_REPO")
     if not repo_id:
-        return None  # fall back to builtin 'base'/'large' assets
+        return None
 
     step = os.getenv("MRT_CKPT_STEP")  # e.g., "1863001"
-    allow = None
-    if step:
-        # only pull that step + optional centroid files
-        allow = [f"checkpoint_{step}/**", "cluster_centroids.npy", "mean_style_embed.npy"]
 
     from huggingface_hub import snapshot_download
+    allow = None
+    if step:
+        base = f"checkpoint_{step}"
+        # include everything under the step *including dotfiles*
+        allow = [
+            f"{base}/**",          # all regular files
+            f"{base}/**/.*",       # dotfiles like .zarray / .zattrs
+            f"{base}/**/.zarray",
+            f"{base}/**/.zattrs",
+        ]
+
     local = snapshot_download(
         repo_id=repo_id,
         repo_type="model",
+        revision=os.getenv("MRT_CKPT_REV", "main"),
         local_dir="/home/appuser/.cache/mrt_ckpt/repo",
         local_dir_use_symlinks=False,
         allow_patterns=allow or ["*"],  # whole repo if no step provided
     )
     root = Path(local)
 
-    # If a step is specified, return that subfolder
     if step:
-        cand = root / f"checkpoint_{step}"
-        if cand.is_dir():
-            return str(cand)
+        step_dir = root / f"checkpoint_{step}"
+        # sanity check: make sure dotfiles arrived
+        if not any(step_dir.rglob(".zarray")):
+            raise RuntimeError(
+                f"Checkpoint appears incomplete (no .zarray files under {step_dir}). "
+                "Ensure allow_patterns includes dotfiles or re-upload preserving dotfiles."
+            )
+        return str(step_dir)
 
-    # Otherwise pick the numerically latest checkpoint_* folder
+    # otherwise pick latest checkpoint_* directory
     step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
     if step_dirs:
-        pick = max(step_dirs, key=lambda d: int(d.name.split("_")[-1]))
+        pick = max(step_dirs, key=lambda d: int(d.name.split('_')[-1]))
+        if not any(pick.rglob(".zarray")):
+            raise RuntimeError(
+                f"Checkpoint appears incomplete (no .zarray files under {pick})."
+            )
         return str(pick)
 
-    # Fallback: repo itself might already be a single checkpoint directory
     return str(root)
 
 
