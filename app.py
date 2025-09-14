@@ -820,6 +820,10 @@ def build_style_vector(
 # ----------------------------
 app = FastAPI()
 
+# Add this after creating your FastAPI app
+interface = create_documentation_interface()
+app = gr.mount_gradio_app(app, interface, path="/documentation")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # or lock to your domain(s)
@@ -2118,7 +2122,7 @@ def read_root():
         """
     return Response(content=html_content, media_type="text/html")
 
-@app.get("/documentation")
-def documentation():
-    interface = create_documentation_interface()
-    return interface.launch(share=False, server_name="0.0.0.0", server_port=None, prevent_thread_lock=True)
+# @app.get("/documentation")
+# def documentation():
+#     interface = create_documentation_interface()
+#     return interface.launch(share=False, server_name="0.0.0.0", server_port=None, prevent_thread_lock=True)
