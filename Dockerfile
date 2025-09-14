@@ -142,7 +142,7 @@ COPY --chown=appuser:appuser app.py /home/appuser/app/app.py
 COPY --chown=appuser:appuser utils.py /home/appuser/app/utils.py
 COPY --chown=appuser:appuser jam_worker.py /home/appuser/app/jam_worker.py
 
-COPY --chown=appuser:appuser documentation.html /home/appuser/app/documentation.html
+COPY --chown=appuser:appuser one_shot_generation.py /home/appuser/app/one_shot_generation.py
 COPY --chown=appuser:appuser documentation.html /home/appuser/app/documentation.html
 
 USER appuser
