@@ -1000,7 +1000,7 @@ class ModelSelect(BaseModel):
 
 @app.post("/model/select")
 def model_select(req: ModelSelect):
-    # Resolve desired target config (fall back to current env)
+    # --- Current env defaults ---
     cur = {
         "size":    os.getenv("MRT_SIZE", "large"),
         "repo":    os.getenv("MRT_CKPT_REPO"),
@@ -1008,34 +1008,74 @@ def model_select(req: ModelSelect):
         "step":    os.getenv("MRT_CKPT_STEP"),
         "assets":  os.getenv("MRT_ASSETS_REPO", _FINETUNE_REPO_DEFAULT),
     }
+
+    # --- Flags for special step values ---
+    no_ckpt = isinstance(req.step, str) and req.step.lower() == "none"
+    latest  = isinstance(req.step, str) and req.step.lower() == "latest"
+
+    # --- Target selection (do not require repo when no_ckpt) ---
     tgt = {
-        "size":   req.size or cur["size"],
-        "repo":   req.repo_id or cur["repo"],
+        "size":   (req.size or cur["size"]),
+        "repo":   (None if no_ckpt else (req.repo_id or cur["repo"])),
         "rev":    (req.revision if req.revision is not None else cur["rev"]),
-        "step":   (None if (isinstance(req.step, str) and req.step.lower()=="latest") else (str(req.step) if req.step is not None else cur["step"])),
+        # None => resolve to "latest" below. Keep None for no_ckpt as well.
+        "step":   (None if (no_ckpt or latest) else (str(req.step) if req.step is not None else cur["step"])),
         "assets": (req.assets_repo_id or req.repo_id or cur["assets"]),
     }
 
-    if not tgt["repo"]:
-        raise HTTPException(status_code=400, detail="repo_id is required at least once before selecting 'latest'.")
+    # ---------- CASE 1: run with NO FINETUNE (stock base/large) ----------
+    if no_ckpt:
+        preview = {
+            "target_size": tgt["size"],
+            "target_repo": None,
+            "target_revision": None,
+            "target_step": None,
+            "assets_repo": None,
+            "assets_probe": {"ok": True, "message": "skipped"},
+            "active_jam": _any_jam_running(),
+        }
+        if req.dry_run:
+            return {"ok": True, "dry_run": True, **preview}
 
-    # ---- Dry-run validation (no env changes) ----
-    # 1) enumerate steps
+        # Jam policy
+        if _any_jam_running():
+            if req.stop_active:
+                _stop_all_jams()
+            else:
+                raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
+
+        # Clear checkpoint + asset env so get_mrt() uses stock weights
+        for k in ("MRT_CKPT_REPO", "MRT_CKPT_REV", "MRT_CKPT_STEP", "MRT_ASSETS_REPO"):
+            os.environ.pop(k, None)
+        os.environ["MRT_SIZE"] = str(tgt["size"])
+
+        # Rebuild model and optionally prewarm
+        global _MRT
+        with _MRT_LOCK:
+            _MRT = None
+        if req.prewarm:
+            get_mrt()
+
+        return {"ok": True, **preview}
+
+    # ---------- CASE 2: select a repo + step (supports "latest") ----------
+    if not tgt["repo"]:
+        raise HTTPException(status_code=400, detail="repo_id is required for model selection.")
+
+    # 1) enumerate available steps
     steps = _list_ckpt_steps(tgt["repo"], tgt["rev"])
     if not steps:
         return {"ok": False, "error": f"No checkpoint files found in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
 
-    # 2) choose step
+    # 2) choose step (explicit or latest)
     chosen_step = int(tgt["step"]) if tgt["step"] is not None else steps[-1]
     if chosen_step not in steps:
         return {"ok": False, "error": f"checkpoint_{chosen_step} not present in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
 
-    # 3) optional: quick asset sanity (only list, don’t download)
-    assets_ok = True
-    assets_msg = "skipped"
+    # 3) optional finetune assets probe (no downloads, just listing)
+    assets_ok, assets_msg = True, "skipped"
     if req.sync_assets:
         try:
-            # a quick probe: ensure either file exists; if not, allow anyway (assets are optional)
             api = HfApi()
             files = set(api.list_repo_files(repo_id=tgt["assets"], repo_type="model"))
             if ("mean_style_embed.npy" not in files) and ("cluster_centroids.npy" not in files):
@@ -1050,34 +1090,34 @@ def model_select(req: ModelSelect):
         "target_repo": tgt["repo"],
         "target_revision": tgt["rev"],
         "target_step": chosen_step,
-        "assets_repo": tgt["assets"] if req.sync_assets else None,
+        "assets_repo": (tgt["assets"] if req.sync_assets else None),
         "assets_probe": {"ok": assets_ok, "message": assets_msg},
         "active_jam": _any_jam_running(),
     }
+
     if req.dry_run:
         return {"ok": True, "dry_run": True, **preview}
 
-    # ---- Enforce jam policy ----
+    # Jam policy
     if _any_jam_running():
         if req.stop_active:
             _stop_all_jams()
         else:
             raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
 
-    # ---- Atomic swap with rollback ----
+    # 4) atomic swap with rollback
     old_env = {
-        "MRT_SIZE":      os.getenv("MRT_SIZE"),
-        "MRT_CKPT_REPO": os.getenv("MRT_CKPT_REPO"),
-        "MRT_CKPT_REV":  os.getenv("MRT_CKPT_REV"),
-        "MRT_CKPT_STEP": os.getenv("MRT_CKPT_STEP"),
-        "MRT_ASSETS_REPO": os.getenv("MRT_ASSETS_REPO"),
+        "MRT_SIZE":         os.getenv("MRT_SIZE"),
+        "MRT_CKPT_REPO":    os.getenv("MRT_CKPT_REPO"),
+        "MRT_CKPT_REV":     os.getenv("MRT_CKPT_REV"),
+        "MRT_CKPT_STEP":    os.getenv("MRT_CKPT_STEP"),
+        "MRT_ASSETS_REPO":  os.getenv("MRT_ASSETS_REPO"),
     }
     try:
-        os.environ["MRT_SIZE"] = str(tgt["size"])
+        os.environ["MRT_SIZE"]      = str(tgt["size"])
         os.environ["MRT_CKPT_REPO"] = str(tgt["repo"])
         os.environ["MRT_CKPT_REV"]  = str(tgt["rev"])
         os.environ["MRT_CKPT_STEP"] = str(chosen_step)
-
         if req.sync_assets:
             os.environ["MRT_ASSETS_REPO"] = str(tgt["assets"])
 
@@ -1086,13 +1126,13 @@ def model_select(req: ModelSelect):
         with _MRT_LOCK:
             _MRT = None
 
-        # optionally sync+load finetune assets
+        # optionally load finetune assets now
         if req.sync_assets:
             _load_finetune_assets_from_hf(os.getenv("MRT_ASSETS_REPO"))
 
-        # optional pre-warm to amortize JIT
+        # optional prewarm to amortize JIT
         if req.prewarm:
-            get_mrt()  # triggers snapshot_download/resolve + init
+            get_mrt()
 
         return {"ok": True, **preview}
     except Exception as e:
@@ -1109,6 +1149,7 @@ def model_select(req: ModelSelect):
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Swap failed: {e}")
+
 
 
 @app.post("/generate")
