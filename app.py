@@ -1001,7 +1001,7 @@ class ModelSelect(BaseModel):
 @app.post("/model/select")
 def model_select(req: ModelSelect):
     # --- Current env defaults ---
-    global_MRT
+    global _MRT
     cur = {
         "size":    os.getenv("MRT_SIZE", "large"),
         "repo":    os.getenv("MRT_CKPT_REPO"),
