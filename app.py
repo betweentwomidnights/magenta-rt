@@ -2118,7 +2118,7 @@ def read_root():
         """
     return Response(content=html_content, media_type="text/html")
 
-@app.get("/documentation") 
+@app.get("/documentation")
 def documentation():
     interface = create_documentation_interface()
-    return gr.mount_gradio_app(app, interface, path="/documentation")
+    return interface.launch(share=False, server_name="0.0.0.0", server_port=None, prevent_thread_lock=True)
