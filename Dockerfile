@@ -145,6 +145,9 @@ COPY --chown=appuser:appuser jam_worker.py /home/appuser/app/jam_worker.py
 COPY --chown=appuser:appuser one_shot_generation.py /home/appuser/app/one_shot_generation.py
 COPY --chown=appuser:appuser documentation.html /home/appuser/app/documentation.html
 
+# Create docs directory and copy documentation files
+COPY --chown=appuser:appuser docs/ /home/appuser/app/docs/
+
 USER appuser
 
 EXPOSE 7860
