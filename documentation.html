@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MagentaRT Research API</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 48px auto; padding: 0 20px; color:#111; }
+    code, pre { background:#f6f8fa; border:1px solid #eaecef; border-radius:6px; padding:2px 6px; }
+    pre { padding:12px; overflow:auto; }
+    .muted { color:#555; }
+    ul { line-height: 1.8; }
+  </style>
+</head>
+<body>
+  <h1>🎵 MagentaRT Research API</h1>
+  <p class="muted"><strong>Purpose:</strong> AI music generation for iOS/web app research using Google's MagentaRT.</p>
+
+  <h2>Available Endpoints</h2>
+  <ul>
+    <li><code>POST /generate</code> – Generate 4–8 bars of music (HTTP, bar-aligned)</li>
+    <li><code>POST /jam/start</code> – Start continuous jamming (HTTP)</li>
+    <li><code>GET /jam/next</code> – Get next chunk (HTTP)</li>
+    <li><code>POST /jam/consume</code> – Confirm a chunk as consumed (HTTP)</li>
+    <li><code>POST /jam/stop</code> – End session (HTTP)</li>
+    <li><code>WEBSOCKET /ws/jam</code> – Realtime streaming (<code>mode="rt"</code>)</li>
+    <li><code>GET /docs</code> – API documentation (Gradio)</li>
+  </ul>
+
+  <h2>WebSocket Quick Start (rt mode)</h2>
+  <p>Connect to <code>wss://&lt;your-space&gt;/ws/jam</code> and send:</p>
+  <pre>{
+  "type": "start",
+  "mode": "rt",
+  "binary_audio": false,
+  "params": {
+    "styles": "warmup",
+    "temperature": 1.1,
+    "topk": 40,
+    "guidance_weight": 1.1,
+    "pace": "realtime",          // or "asap" to bootstrap quickly
+    "max_decode_frames": 50      // default ~2.0s; try 36–45 on smaller GPUs
+  }
+}</pre>
+  <p>Update parameters live:</p>
+  <pre>{
+  "type": "update",
+  "styles": "jazz, hiphop",
+  "style_weights": "1.0,0.8",
+  "temperature": 1.2,
+  "topk": 64,
+  "guidance_weight": 1.0,
+  "pace": "realtime",
+  "max_decode_frames": 40
+}</pre>
+  <p>Stop:</p>
+  <pre>{"type":"stop"}</pre>
+
+  <h2>Notes</h2>
+  <ul>
+    <li>Audio: 48 kHz stereo, ~2.0 s chunks by default with ~40 ms crossfade.</li>
+    <li>L40S 48GB: faster than realtime → prefer <code>pace: "realtime"</code>.</li>
+    <li>L4 24GB: slightly under realtime even with pre-roll and tuning.</li>
+    <li>For sustained realtime, target ~40 GB VRAM per active stream (e.g., A100 40GB or ≈35–40 GB MIG slice).</li>
+  </ul>
+
+  <p class="muted"><strong>Licensing:</strong> Uses MagentaRT (Apache 2.0 + CC-BY 4.0). Users are responsible for outputs.</p>
+  <p>See <a href="/docs">/docs</a> for full API details and client examples.</p>
+</body>
+</html>
