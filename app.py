@@ -51,7 +51,7 @@ import uuid, threading
 import logging
 
 import gradio as gr
-from typing import Optional
+from typing import Optional, Union, Literal
 
 
 import json, asyncio, base64
@@ -68,13 +68,52 @@ except Exception:
 
 import re, tarfile
 from pathlib import Path
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, HfApi
+
+from pydantic import BaseModel
 
 # ---- Finetune assets (mean & centroids) --------------------------------------
 _FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
 _ASSETS_REPO_ID: str | None = None
 _MEAN_EMBED: np.ndarray | None = None           # shape (D,) dtype float32
 _CENTROIDS: np.ndarray | None = None            # shape (K, D) dtype float32
+
+_STEP_RE = re.compile(r"(?:^|/)checkpoint_(\d+)(?:/|\.tar\.gz|\.tgz)?$")
+
+def _list_ckpt_steps(repo_id: str, revision: str = "main") -> list[int]:
+    """
+    List available checkpoint steps in a HF model repo without downloading all weights.
+    Looks for:
+      checkpoint_<step>/
+      checkpoint_<step>.tgz | .tar.gz
+      archives/checkpoint_<step>.tgz | .tar.gz
+    """
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
+    steps = set()
+    for f in files:
+        m = _STEP_RE.search(f)
+        if m:
+            try:
+                steps.add(int(m.group(1)))
+            except:
+                pass
+    return sorted(steps)
+
+def _step_exists(repo_id: str, revision: str, step: int) -> bool:
+    return step in _list_ckpt_steps(repo_id, revision)
+
+def _any_jam_running() -> bool:
+    with jam_lock:
+        return any(w.is_alive() for w in jam_registry.values())
+
+def _stop_all_jams(timeout: float = 5.0):
+    with jam_lock:
+        for sid, w in list(jam_registry.items()):
+            if w.is_alive():
+                w.stop()
+                w.join(timeout=timeout)
+                jam_registry.pop(sid, None)
 
 def _load_finetune_assets_from_hf(repo_id: str | None) -> tuple[bool, str]:
     """
@@ -926,6 +965,151 @@ def model_assets_status():
         "centroid_count": None if _CENTROIDS is None else int(_CENTROIDS.shape[0]),
         "embedding_dim": d,
     }
+
+@app.get("/model/config")
+def model_config():
+    mrt = None
+    try:
+        mrt = get_mrt()
+    except Exception:
+        pass
+    return {
+        "size": os.getenv("MRT_SIZE", "large"),
+        "repo": os.getenv("MRT_CKPT_REPO"),
+        "revision": os.getenv("MRT_CKPT_REV", "main"),
+        "selected_step": os.getenv("MRT_CKPT_STEP"),
+        "resolved_ckpt_dir": _resolve_checkpoint_dir(),  # may be None if not yet downloaded
+        "loaded": bool(mrt),
+    }
+
+@app.get("/model/checkpoints")
+def model_checkpoints(repo_id: str, revision: str = "main"):
+    steps = _list_ckpt_steps(repo_id, revision)
+    return {"repo": repo_id, "revision": revision, "steps": steps, "latest": (steps[-1] if steps else None)}
+
+class ModelSelect(BaseModel):
+    size: Optional[Literal["base","large"]] = None
+    repo_id: Optional[str] = None
+    revision: Optional[str] = "main"
+    step: Optional[Union[int, str]] = None   # allow "latest"
+    assets_repo_id: Optional[str] = None     # default: follow repo_id
+    sync_assets: bool = True                 # load mean/centroids from repo
+    prewarm: bool = False                    # call get_mrt() to build right away
+    stop_active: bool = True                 # auto-stop jams; else 409
+    dry_run: bool = False                    # validate only, don't swap
+
+@app.post("/model/select")
+def model_select(req: ModelSelect):
+    # Resolve desired target config (fall back to current env)
+    cur = {
+        "size":    os.getenv("MRT_SIZE", "large"),
+        "repo":    os.getenv("MRT_CKPT_REPO"),
+        "rev":     os.getenv("MRT_CKPT_REV", "main"),
+        "step":    os.getenv("MRT_CKPT_STEP"),
+        "assets":  os.getenv("MRT_ASSETS_REPO", _FINETUNE_REPO_DEFAULT),
+    }
+    tgt = {
+        "size":   req.size or cur["size"],
+        "repo":   req.repo_id or cur["repo"],
+        "rev":    (req.revision if req.revision is not None else cur["rev"]),
+        "step":   (None if (isinstance(req.step, str) and req.step.lower()=="latest") else (str(req.step) if req.step is not None else cur["step"])),
+        "assets": (req.assets_repo_id or req.repo_id or cur["assets"]),
+    }
+
+    if not tgt["repo"]:
+        raise HTTPException(status_code=400, detail="repo_id is required at least once before selecting 'latest'.")
+
+    # ---- Dry-run validation (no env changes) ----
+    # 1) enumerate steps
+    steps = _list_ckpt_steps(tgt["repo"], tgt["rev"])
+    if not steps:
+        return {"ok": False, "error": f"No checkpoint files found in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
+
+    # 2) choose step
+    chosen_step = int(tgt["step"]) if tgt["step"] is not None else steps[-1]
+    if chosen_step not in steps:
+        return {"ok": False, "error": f"checkpoint_{chosen_step} not present in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
+
+    # 3) optional: quick asset sanity (only list, don’t download)
+    assets_ok = True
+    assets_msg = "skipped"
+    if req.sync_assets:
+        try:
+            # a quick probe: ensure either file exists; if not, allow anyway (assets are optional)
+            api = HfApi()
+            files = set(api.list_repo_files(repo_id=tgt["assets"], repo_type="model"))
+            if ("mean_style_embed.npy" not in files) and ("cluster_centroids.npy" not in files):
+                assets_ok, assets_msg = False, f"No finetune asset files in {tgt['assets']}"
+            else:
+                assets_msg = "found"
+        except Exception as e:
+            assets_ok, assets_msg = False, f"probe failed: {e}"
+
+    preview = {
+        "target_size": tgt["size"],
+        "target_repo": tgt["repo"],
+        "target_revision": tgt["rev"],
+        "target_step": chosen_step,
+        "assets_repo": tgt["assets"] if req.sync_assets else None,
+        "assets_probe": {"ok": assets_ok, "message": assets_msg},
+        "active_jam": _any_jam_running(),
+    }
+    if req.dry_run:
+        return {"ok": True, "dry_run": True, **preview}
+
+    # ---- Enforce jam policy ----
+    if _any_jam_running():
+        if req.stop_active:
+            _stop_all_jams()
+        else:
+            raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
+
+    # ---- Atomic swap with rollback ----
+    old_env = {
+        "MRT_SIZE":      os.getenv("MRT_SIZE"),
+        "MRT_CKPT_REPO": os.getenv("MRT_CKPT_REPO"),
+        "MRT_CKPT_REV":  os.getenv("MRT_CKPT_REV"),
+        "MRT_CKPT_STEP": os.getenv("MRT_CKPT_STEP"),
+        "MRT_ASSETS_REPO": os.getenv("MRT_ASSETS_REPO"),
+    }
+    try:
+        os.environ["MRT_SIZE"] = str(tgt["size"])
+        os.environ["MRT_CKPT_REPO"] = str(tgt["repo"])
+        os.environ["MRT_CKPT_REV"]  = str(tgt["rev"])
+        os.environ["MRT_CKPT_STEP"] = str(chosen_step)
+
+        if req.sync_assets:
+            os.environ["MRT_ASSETS_REPO"] = str(tgt["assets"])
+
+        # force rebuild
+        global _MRT
+        with _MRT_LOCK:
+            _MRT = None
+
+        # optionally sync+load finetune assets
+        if req.sync_assets:
+            _load_finetune_assets_from_hf(os.getenv("MRT_ASSETS_REPO"))
+
+        # optional pre-warm to amortize JIT
+        if req.prewarm:
+            get_mrt()  # triggers snapshot_download/resolve + init
+
+        return {"ok": True, **preview}
+    except Exception as e:
+        # rollback on error
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        with _MRT_LOCK:
+            _MRT = None
+        try:
+            get_mrt()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Swap failed: {e}")
+
 
 @app.post("/generate")
 def generate(
