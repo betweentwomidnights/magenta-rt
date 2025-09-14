@@ -292,17 +292,6 @@ def _patch_t5x_for_gpu_coords():
 # Call the patch immediately at import time (before MagentaRT init)
 _patch_t5x_for_gpu_coords()
 
-def load_doc_content(filename: str) -> str:
-    """Load markdown content from docs directory, with fallback."""
-    try:
-        doc_path = Path(__file__).parent / "docs" / filename
-        return doc_path.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return f"⚠️ Documentation file `{filename}` not found. Please check the docs directory."
-    except Exception as e:
-        return f"⚠️ Error loading `{filename}`: {e}"
-
-
 def create_documentation_interface():
     """Create a Gradio interface for documentation and transparency"""
     with gr.Blocks(title="MagentaRT Research API", theme=gr.themes.Soft()) as interface:
@@ -322,31 +311,223 @@ continuous music either as **bar-aligned chunks over HTTP** or as **low-latency 
             # About & current status
             # ------------------------------------------------------------------
             with gr.Tab("📖 About & Status"):
-                gr.Markdown(load_doc_content("about_status.md"))
+                gr.Markdown(
+                    r"""
+## What this is
+We're exploring AI‑assisted loop‑based music creation that can run on GPUs (not just TPUs) and stream to apps in realtime.
+
+### Implemented backends
+- **HTTP (bar‑aligned):** `/generate`, `/jam/start`, `/jam/next`, `/jam/stop`, `/jam/update`, etc.
+- **WebSocket (realtime):** `ws://…/ws/jam` with `mode="rt"` (Colab‑style continuous chunks). New in this build.
+
+## What we learned (GPU notes)
+- **L40S 48GB:** comfortably **faster than realtime** → we added a `pace: "realtime"` switch so the server doesn’t outrun playback.
+- **L4 24GB:** **consistently just under realtime**; even with pre‑roll buffering, TF32/JAX tunings, reduced chunk size, and the **base** checkpoint, we still see eventual under‑runs.
+- **Implication:** For production‑quality realtime, aim for ~**40GB VRAM** per user/session (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer parts). Smaller GPUs can demo, but sustained realtime is not reliable.
+
+## Model / audio specs
+- **Model:** MagentaRT (T5X; decoder RVQ depth = 16)
+- **Audio:** 48 kHz stereo, 2.0 s chunks by default, 40 ms crossfade
+- **Context:** 10 s rolling context window
+                    """
+                )
 
             # ------------------------------------------------------------------
             # HTTP API
             # ------------------------------------------------------------------
             with gr.Tab("🔧 API (HTTP)"):
-                gr.Markdown(load_doc_content("api_http.md"))
+                gr.Markdown(
+                    r"""
+### Single Generation
+```bash
+curl -X POST \
+  "$HOST/generate" \
+  -F "loop_audio=@drum_loop.wav" \
+  -F "bpm=120" \
+  -F "bars=8" \
+  -F "styles=acid house,techno" \
+  -F "guidance_weight=5.0" \
+  -F "temperature=1.1"
+```
+
+### Continuous Jamming (bar‑aligned, HTTP)
+```bash
+# 1) Start a session
+echo $(curl -s -X POST "$HOST/jam/start" \
+  -F "loop_audio=@loop.wav" \
+  -F "bpm=120" \
+  -F "bars_per_chunk=8") | jq .
+# → {"session_id":"…"}
+
+# 2) Pull next chunk (repeat)
+curl "$HOST/jam/next?session_id=$SESSION"
+
+# 3) Stop
+curl -X POST "$HOST/jam/stop" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"'$SESSION'"}'
+```
+
+### Common parameters
+- **bpm** *(int)* – beats per minute
+- **bars / bars_per_chunk** *(int)* – musical length
+- **styles** *(str)* – comma‑separated text prompts (mixed internally)
+- **guidance_weight** *(float)* – style adherence (CFG weight)
+- **temperature / topk** – sampling controls
+- **intro_bars_to_drop** *(int, /generate)* – generate-and-trim intro
+                    """
+                )
 
             # ------------------------------------------------------------------
-            # WebSocket API: realtime ('rt' mode)
+            # WebSocket API: realtime (‘rt’ mode)
             # ------------------------------------------------------------------
             with gr.Tab("🧩 API (WebSocket • rt mode)"):
-                gr.Markdown(load_doc_content("api_websocket.md"))
+                gr.Markdown(
+                    r"""
+Connect to `wss://…/ws/jam` and send a **JSON control stream**. In `rt` mode the server emits ~2 s WAV chunks (or binary frames) continuously.
+
+### Start (client → server)
+```jsonc
+{
+  "type": "start",
+  "mode": "rt",
+  "binary_audio": false,          // true → raw WAV bytes + separate chunk_meta
+  "params": {
+    "styles": "heavy metal",     // or "jazz, hiphop"
+    "style_weights": "1.0,1.0",  // optional, auto‑normalized
+    "temperature": 1.1,
+    "topk": 40,
+    "guidance_weight": 1.1,
+    "pace": "realtime",          // "realtime" | "asap" (default)
+    "max_decode_frames": 50       // 50≈2.0s; try 36–45 on smaller GPUs
+  }
+}
+```
+
+### Server events (server → client)
+- `{"type":"started","mode":"rt"}` – handshake
+- `{"type":"chunk","audio_base64":"…","metadata":{…}}` – base64 WAV
+  - `metadata.sample_rate` *(int)* – usually 48000
+  - `metadata.chunk_frames` *(int)* – e.g., 50
+  - `metadata.chunk_seconds` *(float)* – frames / 25.0
+  - `metadata.crossfade_seconds` *(float)* – typically 0.04
+- `{"type":"chunk_meta","metadata":{…}}` – sent **after** a binary frame when `binary_audio=true`
+- `{"type":"status",…}`, `{"type":"error",…}`, `{"type":"stopped"}`
+
+### Update (client → server)
+```jsonc
+{
+  "type": "update",
+  "styles": "jazz, hiphop",
+  "style_weights": "1.0,0.8",
+  "temperature": 1.2,
+  "topk": 64,
+  "guidance_weight": 1.0,
+  "pace": "realtime",            // optional live flip
+  "max_decode_frames": 40         // optional; <= 50
+}
+```
+
+### Stop / ping
+```json
+{"type":"stop"}
+{"type":"ping"}
+```
+
+### Browser quick‑start (schedules seamlessly with 25–40 ms crossfade)
+```html
+<script>
+const XFADE = 0.025; // 25 ms
+let ctx, gain, ws, nextTime = 0;
+async function start(){
+  ctx = new (window.AudioContext||window.webkitAudioContext)();
+  gain = ctx.createGain(); gain.connect(ctx.destination);
+  ws = new WebSocket("wss://YOUR_SPACE/ws/jam");
+  ws.onopen = ()=> ws.send(JSON.stringify({
+    type:"start", mode:"rt", binary_audio:false,
+    params:{ styles:"warmup", temperature:1.1, topk:40, guidance_weight:1.1, pace:"realtime" }
+  }));
+  ws.onmessage = async ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "chunk" && msg.audio_base64){
+      const bin = atob(msg.audio_base64); const buf = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+      const ab = buf.buffer; const audio = await ctx.decodeAudioData(ab);
+      const src = ctx.createBufferSource(); const g = ctx.createGain();
+      src.buffer = audio; src.connect(g); g.connect(gain);
+      if (nextTime < ctx.currentTime + 0.05) nextTime = ctx.currentTime + 0.12;
+      const startAt = nextTime, dur = audio.duration;
+      nextTime = startAt + Math.max(0, dur - XFADE);
+      g.gain.setValueAtTime(0, startAt);
+      g.gain.linearRampToValueAtTime(1, startAt + XFADE);
+      g.gain.setValueAtTime(1, startAt + Math.max(0, dur - XFADE));
+      g.gain.linearRampToValueAtTime(0, startAt + dur);
+      src.start(startAt);
+    }
+  };
+}
+</script>
+```
+
+### Python client (async)
+```python
+import asyncio, json, websockets, base64, soundfile as sf, io
+async def run(url):
+  async with websockets.connect(url) as ws:
+    await ws.send(json.dumps({"type":"start","mode":"rt","binary_audio":False,
+      "params": {"styles":"warmup","temperature":1.1,"topk":40,"guidance_weight":1.1,"pace":"realtime"}}))
+    while True:
+      msg = json.loads(await ws.recv())
+      if msg.get("type") == "chunk":
+        wav = base64.b64decode(msg["audio_base64"])  # bytes of a WAV
+        x, sr = sf.read(io.BytesIO(wav), dtype="float32")
+        print("chunk", x.shape, sr)
+      elif msg.get("type") in ("stopped","error"): break
+asyncio.run(run("wss://YOUR_SPACE/ws/jam"))
+```
+                    """
+                )
 
             # ------------------------------------------------------------------
             # Performance & hardware guidance
             # ------------------------------------------------------------------
             with gr.Tab("📊 Performance & Hardware"):
-                gr.Markdown(load_doc_content("performance.md"))
+                gr.Markdown(
+                    r"""
+### Current observations
+- **L40S 48GB** → faster than realtime. Use `pace:"realtime"` to avoid client over‑buffering.
+- **L4 24GB** → slightly **below** realtime even with pre‑roll buffering, TF32/Autotune, smaller chunks (`max_decode_frames`), and the **base** checkpoint.
+
+### Practical guidance
+- For consistent realtime, target **~40GB VRAM per active stream** (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer GPUs).
+- Keep client‑side **overlap‑add** (25–40 ms) for seamless chunk joins.
+- Prefer **`pace:"realtime"`** once playback begins; use **ASAP** only to build a short pre‑roll if needed.
+- Optional knob: **`max_decode_frames`** (default **50** ≈ 2.0 s). Reducing to **36–45** can lower per‑chunk latency/VRAM, but doesn’t increase frames/sec throughput.
+
+### Concurrency
+This research build is designed for **one active jam per GPU**. Concurrency would require GPU partitioning (MIG) or horizontal scaling with a session scheduler.
+                    """
+                )
 
             # ------------------------------------------------------------------
             # Changelog & legal
             # ------------------------------------------------------------------
             with gr.Tab("🗒️ Changelog & Legal"):
-                gr.Markdown(load_doc_content("changelog.md"))
+                gr.Markdown(
+                    r"""
+### Recent changes
+- New **WebSocket realtime** route: `/ws/jam` (`mode:"rt"`)
+- Added server pacing flag: `pace: "realtime" | "asap"`
+- Exposed `max_decode_frames` for shorter chunks on smaller GPUs
+- Client test page now does proper **overlap‑add** crossfade between chunks
+
+### Licensing
+This project uses MagentaRT under:
+- **Code:** Apache 2.0
+- **Model weights:** CC‑BY 4.0
+Please review the MagentaRT repo for full terms.
+                    """
+                )
 
         gr.Markdown(
             r"""
@@ -1936,3 +2117,8 @@ def read_root():
         </body></html>
         """
     return Response(content=html_content, media_type="text/html")
+
+@app.get("/documentation") 
+def documentation():
+    interface = create_documentation_interface()
+    return gr.mount_gradio_app(app, interface, path="/documentation")
