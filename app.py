@@ -820,10 +820,6 @@ def build_style_vector(
 # ----------------------------
 app = FastAPI()
 
-# Add this after creating your FastAPI app
-interface = create_documentation_interface()
-app = gr.mount_gradio_app(app, interface, path="/documentation")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # or lock to your domain(s)
@@ -2122,7 +2118,37 @@ def read_root():
         """
     return Response(content=html_content, media_type="text/html")
 
+def load_doc_content(filename: str) -> str:
+    """Load markdown content from docs directory, with fallback."""
+    try:
+        doc_path = Path(__file__).parent / "docs" / filename
+        return doc_path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return f"⚠️ Documentation file `{filename}` not found. Please check the docs directory."
+    except Exception as e:
+        return f"⚠️ Error loading `{filename}`: {e}"
+
 @app.get("/documentation")
 def documentation():
-    interface = create_documentation_interface()
-    return interface.launch(share=False, server_name="0.0.0.0", server_port=None, prevent_thread_lock=True)
+    # Just return a simple combined markdown page
+    all_content = f"""
+# MagentaRT Documentation
+
+## About & Status
+{load_doc_content("about_status.md")}
+
+## HTTP API  
+{load_doc_content("api_http.md")}
+
+## WebSocket API
+{load_doc_content("api_websocket.md")}
+
+## Performance
+{load_doc_content("performance.md")}
+
+## Changelog
+{load_doc_content("changelog.md")}
+    """
+    
+    # Convert markdown to HTML if you want, or just serve as plain text
+    return Response(content=all_content, media_type="text/plain")
