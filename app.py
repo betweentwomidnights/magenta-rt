@@ -968,18 +968,64 @@ def model_assets_status():
 
 @app.get("/model/config")
 def model_config():
-    mrt = None
-    try:
-        mrt = get_mrt()
-    except Exception:
-        pass
+    """
+    Lightweight config snapshot:
+      - never calls get_mrt() (no model build / no downloads)
+      - never calls snapshot_download()
+      - reports whether a model instance is currently loaded in memory
+      - best-effort local checkpoint presence (no network)
+    """
+    # Read-only snapshot of in-memory model presence
+    with _MRT_LOCK:
+        loaded = (_MRT is not None)
+
+    size   = os.getenv("MRT_SIZE", "large")
+    repo   = os.getenv("MRT_CKPT_REPO")
+    rev    = os.getenv("MRT_CKPT_REV", "main")
+    step   = os.getenv("MRT_CKPT_STEP")
+    assets = os.getenv("MRT_ASSETS_REPO")
+
+    # Best-effort local cache probe (no network)
+    def _local_ckpt_dir(step_str: str | None) -> str | None:
+        if not step_str:
+            return None
+        try:
+            from pathlib import Path
+            import re
+            step = re.escape(str(step_str))
+            candidates: list[str] = []
+            for root in ("/home/appuser/.cache/mrt_ckpt/extracted",
+                         "/home/appuser/.cache/mrt_ckpt/repo"):
+                p = Path(root)
+                if not p.exists():
+                    continue
+                # Look for exact "checkpoint_<step>" directories anywhere under these roots
+                for d in p.rglob(f"checkpoint_{step}"):
+                    if d.is_dir():
+                        candidates.append(str(d))
+            return candidates[0] if candidates else None
+        except Exception:
+            return None
+
+    local_ckpt = _local_ckpt_dir(step)
+
     return {
-        "size": os.getenv("MRT_SIZE", "large"),
-        "repo": os.getenv("MRT_CKPT_REPO"),
-        "revision": os.getenv("MRT_CKPT_REV", "main"),
-        "selected_step": os.getenv("MRT_CKPT_STEP"),
-        "resolved_ckpt_dir": _resolve_checkpoint_dir(),  # may be None if not yet downloaded
-        "loaded": bool(mrt),
+        "size": size,
+        "repo": repo,
+        "revision": rev,
+        "selected_step": step,
+        "assets_repo": assets,
+
+        # in-memory + local cache hints (no network, no model build)
+        "loaded": loaded,
+        "active_jam": _any_jam_running(),
+        "local_checkpoint_dir": local_ckpt,   # None if not found locally
+
+        # steering assets currently resident in memory
+        "mean_loaded": (_MEAN_EMBED is not None),
+        "centroids_loaded": (_CENTROIDS is not None),
+        "centroid_count": (None if _CENTROIDS is None else int(_CENTROIDS.shape[0])),
+        "warmup_done": bool(_WARMED),
     }
 
 @app.get("/model/checkpoints")
