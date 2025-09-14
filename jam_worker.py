@@ -35,7 +35,7 @@ class JamParams:
     guidance_weight: float = 1.1
     temperature: float = 1.1
     topk: int = 40
-    style_ramp_seconds: float = 0.0  # 0 => instant (current behavior), try 6.0–10.0 for gentle glides
+    style_ramp_seconds: float = 8.0  # 0 => instant (current behavior), try 6.0–10.0 for gentle glides
 
 
 @dataclass
