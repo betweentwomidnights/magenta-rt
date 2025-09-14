@@ -1001,6 +1001,7 @@ class ModelSelect(BaseModel):
 @app.post("/model/select")
 def model_select(req: ModelSelect):
     # --- Current env defaults ---
+    global_MRT
     cur = {
         "size":    os.getenv("MRT_SIZE", "large"),
         "repo":    os.getenv("MRT_CKPT_REPO"),
@@ -1050,7 +1051,7 @@ def model_select(req: ModelSelect):
         os.environ["MRT_SIZE"] = str(tgt["size"])
 
         # Rebuild model and optionally prewarm
-        global _MRT
+        
         with _MRT_LOCK:
             _MRT = None
         if req.prewarm:
@@ -1122,7 +1123,7 @@ def model_select(req: ModelSelect):
             os.environ["MRT_ASSETS_REPO"] = str(tgt["assets"])
 
         # force rebuild
-        global _MRT
+        
         with _MRT_LOCK:
             _MRT = None
 
