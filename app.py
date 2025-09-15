@@ -74,6 +74,8 @@ from huggingface_hub import snapshot_download, HfApi
 
 from pydantic import BaseModel
 
+from model_management import CheckpointManager, AssetManager, ModelSelector, ModelSelect
+
 # ---- Finetune assets (mean & centroids) --------------------------------------
 _FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
 _ASSETS_REPO_ID: str | None = None
@@ -82,28 +84,38 @@ _CENTROIDS: np.ndarray | None = None            # shape (K, D) dtype float32
 
 _STEP_RE = re.compile(r"(?:^|/)checkpoint_(\d+)(?:/|\.tar\.gz|\.tgz)?$")
 
-def _list_ckpt_steps(repo_id: str, revision: str = "main") -> list[int]:
-    """
-    List available checkpoint steps in a HF model repo without downloading all weights.
-    Looks for:
-      checkpoint_<step>/
-      checkpoint_<step>.tgz | .tar.gz
-      archives/checkpoint_<step>.tgz | .tar.gz
-    """
-    api = HfApi()
-    files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
-    steps = set()
-    for f in files:
-        m = _STEP_RE.search(f)
-        if m:
-            try:
-                steps.add(int(m.group(1)))
-            except:
-                pass
-    return sorted(steps)
+# Create instances (these don't modify globals)
+asset_manager = AssetManager()
+model_selector = ModelSelector(CheckpointManager(), asset_manager)
 
-def _step_exists(repo_id: str, revision: str, step: int) -> bool:
-    return step in _list_ckpt_steps(repo_id, revision)
+# Sync asset manager with existing globals
+def _sync_asset_manager():
+    asset_manager.mean_embed = _MEAN_EMBED
+    asset_manager.centroids = _CENTROIDS  
+    asset_manager.assets_repo_id = _ASSETS_REPO_ID
+
+# def _list_ckpt_steps(repo_id: str, revision: str = "main") -> list[int]:
+#     """
+#     List available checkpoint steps in a HF model repo without downloading all weights.
+#     Looks for:
+#       checkpoint_<step>/
+#       checkpoint_<step>.tgz | .tar.gz
+#       archives/checkpoint_<step>.tgz | .tar.gz
+#     """
+#     api = HfApi()
+#     files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
+#     steps = set()
+#     for f in files:
+#         m = _STEP_RE.search(f)
+#         if m:
+#             try:
+#                 steps.add(int(m.group(1)))
+#             except:
+#                 pass
+#     return sorted(steps)
+
+# def _step_exists(repo_id: str, revision: str, step: int) -> bool:
+#     return step in _list_ckpt_steps(repo_id, revision)
 
 def _any_jam_running() -> bool:
     with jam_lock:
@@ -117,131 +129,131 @@ def _stop_all_jams(timeout: float = 5.0):
                 w.join(timeout=timeout)
                 jam_registry.pop(sid, None)
 
-def _load_finetune_assets_from_hf(repo_id: str | None) -> tuple[bool, str]:
-    """
-    Download & load mean_style_embed.npy and cluster_centroids.npy from a HF model repo.
-    Safe to call multiple times; will overwrite globals if successful.
-    """
-    global _ASSETS_REPO_ID, _MEAN_EMBED, _CENTROIDS
-    repo_id = repo_id or _FINETUNE_REPO_DEFAULT
-    try:
-        from huggingface_hub import hf_hub_download
-        mean_path = None
-        cent_path = None
-        try:
-            mean_path = hf_hub_download(repo_id, filename="mean_style_embed.npy", repo_type="model")
-        except Exception:
-            pass
-        try:
-            cent_path = hf_hub_download(repo_id, filename="cluster_centroids.npy", repo_type="model")
-        except Exception:
-            pass
+# def _load_finetune_assets_from_hf(repo_id: str | None) -> tuple[bool, str]:
+#     """
+#     Download & load mean_style_embed.npy and cluster_centroids.npy from a HF model repo.
+#     Safe to call multiple times; will overwrite globals if successful.
+#     """
+#     global _ASSETS_REPO_ID, _MEAN_EMBED, _CENTROIDS
+#     repo_id = repo_id or _FINETUNE_REPO_DEFAULT
+#     try:
+#         from huggingface_hub import hf_hub_download
+#         mean_path = None
+#         cent_path = None
+#         try:
+#             mean_path = hf_hub_download(repo_id, filename="mean_style_embed.npy", repo_type="model")
+#         except Exception:
+#             pass
+#         try:
+#             cent_path = hf_hub_download(repo_id, filename="cluster_centroids.npy", repo_type="model")
+#         except Exception:
+#             pass
 
-        if mean_path is None and cent_path is None:
-            return False, f"No finetune asset files found in repo {repo_id}"
+#         if mean_path is None and cent_path is None:
+#             return False, f"No finetune asset files found in repo {repo_id}"
 
-        if mean_path is not None:
-            m = np.load(mean_path)
-            if m.ndim != 1:
-                return False, f"mean_style_embed.npy must be 1-D (got {m.shape})"
-        else:
-            m = None
+#         if mean_path is not None:
+#             m = np.load(mean_path)
+#             if m.ndim != 1:
+#                 return False, f"mean_style_embed.npy must be 1-D (got {m.shape})"
+#         else:
+#             m = None
 
-        if cent_path is not None:
-            c = np.load(cent_path)
-            if c.ndim != 2:
-                return False, f"cluster_centroids.npy must be 2-D (got {c.shape})"
-        else:
-            c = None
+#         if cent_path is not None:
+#             c = np.load(cent_path)
+#             if c.ndim != 2:
+#                 return False, f"cluster_centroids.npy must be 2-D (got {c.shape})"
+#         else:
+#             c = None
 
-        # Optional: shape check vs model embedding dim once model is alive
-        try:
-            d = int(get_mrt().style_model.config.embedding_dim)
-            if m is not None and m.shape[0] != d:
-                return False, f"mean_style_embed dim {m.shape[0]} != model dim {d}"
-            if c is not None and c.shape[1] != d:
-                return False, f"cluster_centroids dim {c.shape[1]} != model dim {d}"
-        except Exception:
-            # Model not built yet; we’ll trust the files and rely on runtime checks later
-            pass
+#         # Optional: shape check vs model embedding dim once model is alive
+#         try:
+#             d = int(get_mrt().style_model.config.embedding_dim)
+#             if m is not None and m.shape[0] != d:
+#                 return False, f"mean_style_embed dim {m.shape[0]} != model dim {d}"
+#             if c is not None and c.shape[1] != d:
+#                 return False, f"cluster_centroids dim {c.shape[1]} != model dim {d}"
+#         except Exception:
+#             # Model not built yet; we’ll trust the files and rely on runtime checks later
+#             pass
 
-        _MEAN_EMBED = m.astype(np.float32, copy=False) if m is not None else None
-        _CENTROIDS = c.astype(np.float32, copy=False) if c is not None else None
-        _ASSETS_REPO_ID = repo_id
-        logging.info("Loaded finetune assets from %s (mean=%s, centroids=%s)",
-                     repo_id,
-                     "yes" if _MEAN_EMBED is not None else "no",
-                     f"{_CENTROIDS.shape[0]}x{_CENTROIDS.shape[1]}" if _CENTROIDS is not None else "no")
-        return True, "ok"
-    except Exception as e:
-        logging.exception("Failed to load finetune assets: %s", e)
-        return False, str(e)
+#         _MEAN_EMBED = m.astype(np.float32, copy=False) if m is not None else None
+#         _CENTROIDS = c.astype(np.float32, copy=False) if c is not None else None
+#         _ASSETS_REPO_ID = repo_id
+#         logging.info("Loaded finetune assets from %s (mean=%s, centroids=%s)",
+#                      repo_id,
+#                      "yes" if _MEAN_EMBED is not None else "no",
+#                      f"{_CENTROIDS.shape[0]}x{_CENTROIDS.shape[1]}" if _CENTROIDS is not None else "no")
+#         return True, "ok"
+#     except Exception as e:
+#         logging.exception("Failed to load finetune assets: %s", e)
+#         return False, str(e)
 
-def _ensure_assets_loaded():
-    # Best-effort lazy load if nothing is loaded yet
-    if _MEAN_EMBED is None and _CENTROIDS is None:
-        _load_finetune_assets_from_hf(_ASSETS_REPO_ID or _FINETUNE_REPO_DEFAULT)
+# def _ensure_assets_loaded():
+#     # Best-effort lazy load if nothing is loaded yet
+#     if _MEAN_EMBED is None and _CENTROIDS is None:
+#         _load_finetune_assets_from_hf(_ASSETS_REPO_ID or _FINETUNE_REPO_DEFAULT)
 # ------------------------------------------------------------------------------
 
-def _resolve_checkpoint_dir() -> str | None:
-    repo_id = os.getenv("MRT_CKPT_REPO")
-    if not repo_id:
-        return None
-    step = os.getenv("MRT_CKPT_STEP")  # e.g. "1863001"
+# def _resolve_checkpoint_dir() -> str | None:
+#     repo_id = os.getenv("MRT_CKPT_REPO")
+#     if not repo_id:
+#         return None
+#     step = os.getenv("MRT_CKPT_STEP")  # e.g. "1863001"
 
-    root = Path(snapshot_download(
-        repo_id=repo_id,
-        repo_type="model",
-        revision=os.getenv("MRT_CKPT_REV", "main"),
-        local_dir="/home/appuser/.cache/mrt_ckpt/repo",
-        local_dir_use_symlinks=False,
-    ))
+#     root = Path(snapshot_download(
+#         repo_id=repo_id,
+#         repo_type="model",
+#         revision=os.getenv("MRT_CKPT_REV", "main"),
+#         local_dir="/home/appuser/.cache/mrt_ckpt/repo",
+#         local_dir_use_symlinks=False,
+#     ))
 
-    # Prefer an archive if present (more reliable for Zarr/T5X)
-    arch_names = [
-        f"checkpoint_{step}.tgz",
-        f"checkpoint_{step}.tar.gz",
-        f"archives/checkpoint_{step}.tgz",
-        f"archives/checkpoint_{step}.tar.gz",
-    ] if step else []
+#     # Prefer an archive if present (more reliable for Zarr/T5X)
+#     arch_names = [
+#         f"checkpoint_{step}.tgz",
+#         f"checkpoint_{step}.tar.gz",
+#         f"archives/checkpoint_{step}.tgz",
+#         f"archives/checkpoint_{step}.tar.gz",
+#     ] if step else []
 
-    cache_root = Path("/home/appuser/.cache/mrt_ckpt/extracted")
-    cache_root.mkdir(parents=True, exist_ok=True)
-    for name in arch_names:
-        arch = root / name
-        if arch.is_file():
-            out_dir = cache_root / f"checkpoint_{step}"
-            marker = out_dir.with_suffix(".ok")
-            if not marker.exists():
-                out_dir.mkdir(parents=True, exist_ok=True)
-                with tarfile.open(arch, "r:*") as tf:
-                    tf.extractall(out_dir)
-                marker.write_text("ok")
-            # sanity: require .zarray to exist inside the extracted tree
-            if not any(out_dir.rglob(".zarray")):
-                raise RuntimeError(f"Extracted archive missing .zarray files: {out_dir}")
-            return str(out_dir / f"checkpoint_{step}") if (out_dir / f"checkpoint_{step}").exists() else str(out_dir)
+#     cache_root = Path("/home/appuser/.cache/mrt_ckpt/extracted")
+#     cache_root.mkdir(parents=True, exist_ok=True)
+#     for name in arch_names:
+#         arch = root / name
+#         if arch.is_file():
+#             out_dir = cache_root / f"checkpoint_{step}"
+#             marker = out_dir.with_suffix(".ok")
+#             if not marker.exists():
+#                 out_dir.mkdir(parents=True, exist_ok=True)
+#                 with tarfile.open(arch, "r:*") as tf:
+#                     tf.extractall(out_dir)
+#                 marker.write_text("ok")
+#             # sanity: require .zarray to exist inside the extracted tree
+#             if not any(out_dir.rglob(".zarray")):
+#                 raise RuntimeError(f"Extracted archive missing .zarray files: {out_dir}")
+#             return str(out_dir / f"checkpoint_{step}") if (out_dir / f"checkpoint_{step}").exists() else str(out_dir)
 
-    # No archive; try raw folder from repo and sanity check.
-    if step:
-        raw = root / f"checkpoint_{step}"
-        if raw.is_dir():
-            if not any(raw.rglob(".zarray")):
-                raise RuntimeError(
-                    f"Downloaded checkpoint_{step} appears incomplete (no .zarray). "
-                    "Upload as a .tgz or push via git from a Unix shell."
-                )
-            return str(raw)
+#     # No archive; try raw folder from repo and sanity check.
+#     if step:
+#         raw = root / f"checkpoint_{step}"
+#         if raw.is_dir():
+#             if not any(raw.rglob(".zarray")):
+#                 raise RuntimeError(
+#                     f"Downloaded checkpoint_{step} appears incomplete (no .zarray). "
+#                     "Upload as a .tgz or push via git from a Unix shell."
+#                 )
+#             return str(raw)
 
-    # Pick latest if no step
-    step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
-    if step_dirs:
-        pick = max(step_dirs, key=lambda d: int(d.name.split('_')[-1]))
-        if not any(pick.rglob(".zarray")):
-            raise RuntimeError(f"Downloaded {pick} appears incomplete (no .zarray).")
-        return str(pick)
+#     # Pick latest if no step
+#     step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
+#     if step_dirs:
+#         pick = max(step_dirs, key=lambda d: int(d.name.split('_')[-1]))
+#         if not any(pick.rglob(".zarray")):
+#             raise RuntimeError(f"Downloaded {pick} appears incomplete (no .zarray).")
+#         return str(pick)
 
-    return None
+#     return None
 
 
 async def send_json_safe(ws: WebSocket, obj) -> bool:
@@ -292,252 +304,6 @@ def _patch_t5x_for_gpu_coords():
 # Call the patch immediately at import time (before MagentaRT init)
 _patch_t5x_for_gpu_coords()
 
-def create_documentation_interface():
-    """Create a Gradio interface for documentation and transparency"""
-    with gr.Blocks(title="MagentaRT Research API", theme=gr.themes.Soft()) as interface:
-        gr.Markdown(
-            r"""
-# 🎵 MagentaRT Live Music Generation Research API
-
-**Research-only implementation for iOS/web app development**
-
-This API uses Google's [MagentaRT](https://github.com/magenta/magenta-realtime) to generate
-continuous music either as **bar-aligned chunks over HTTP** or as **low-latency realtime chunks via WebSocket**.
-            """
-        )
-
-        with gr.Tabs():
-            # ------------------------------------------------------------------
-            # About & current status
-            # ------------------------------------------------------------------
-            with gr.Tab("📖 About & Status"):
-                gr.Markdown(
-                    r"""
-## What this is
-We're exploring AI‑assisted loop‑based music creation that can run on GPUs (not just TPUs) and stream to apps in realtime.
-
-### Implemented backends
-- **HTTP (bar‑aligned):** `/generate`, `/jam/start`, `/jam/next`, `/jam/stop`, `/jam/update`, etc.
-- **WebSocket (realtime):** `ws://…/ws/jam` with `mode="rt"` (Colab‑style continuous chunks). New in this build.
-
-## What we learned (GPU notes)
-- **L40S 48GB:** comfortably **faster than realtime** → we added a `pace: "realtime"` switch so the server doesn’t outrun playback.
-- **L4 24GB:** **consistently just under realtime**; even with pre‑roll buffering, TF32/JAX tunings, reduced chunk size, and the **base** checkpoint, we still see eventual under‑runs.
-- **Implication:** For production‑quality realtime, aim for ~**40GB VRAM** per user/session (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer parts). Smaller GPUs can demo, but sustained realtime is not reliable.
-
-## Model / audio specs
-- **Model:** MagentaRT (T5X; decoder RVQ depth = 16)
-- **Audio:** 48 kHz stereo, 2.0 s chunks by default, 40 ms crossfade
-- **Context:** 10 s rolling context window
-                    """
-                )
-
-            # ------------------------------------------------------------------
-            # HTTP API
-            # ------------------------------------------------------------------
-            with gr.Tab("🔧 API (HTTP)"):
-                gr.Markdown(
-                    r"""
-### Single Generation
-```bash
-curl -X POST \
-  "$HOST/generate" \
-  -F "loop_audio=@drum_loop.wav" \
-  -F "bpm=120" \
-  -F "bars=8" \
-  -F "styles=acid house,techno" \
-  -F "guidance_weight=5.0" \
-  -F "temperature=1.1"
-```
-
-### Continuous Jamming (bar‑aligned, HTTP)
-```bash
-# 1) Start a session
-echo $(curl -s -X POST "$HOST/jam/start" \
-  -F "loop_audio=@loop.wav" \
-  -F "bpm=120" \
-  -F "bars_per_chunk=8") | jq .
-# → {"session_id":"…"}
-
-# 2) Pull next chunk (repeat)
-curl "$HOST/jam/next?session_id=$SESSION"
-
-# 3) Stop
-curl -X POST "$HOST/jam/stop" \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"'$SESSION'"}'
-```
-
-### Common parameters
-- **bpm** *(int)* – beats per minute
-- **bars / bars_per_chunk** *(int)* – musical length
-- **styles** *(str)* – comma‑separated text prompts (mixed internally)
-- **guidance_weight** *(float)* – style adherence (CFG weight)
-- **temperature / topk** – sampling controls
-- **intro_bars_to_drop** *(int, /generate)* – generate-and-trim intro
-                    """
-                )
-
-            # ------------------------------------------------------------------
-            # WebSocket API: realtime (‘rt’ mode)
-            # ------------------------------------------------------------------
-            with gr.Tab("🧩 API (WebSocket • rt mode)"):
-                gr.Markdown(
-                    r"""
-Connect to `wss://…/ws/jam` and send a **JSON control stream**. In `rt` mode the server emits ~2 s WAV chunks (or binary frames) continuously.
-
-### Start (client → server)
-```jsonc
-{
-  "type": "start",
-  "mode": "rt",
-  "binary_audio": false,          // true → raw WAV bytes + separate chunk_meta
-  "params": {
-    "styles": "heavy metal",     // or "jazz, hiphop"
-    "style_weights": "1.0,1.0",  // optional, auto‑normalized
-    "temperature": 1.1,
-    "topk": 40,
-    "guidance_weight": 1.1,
-    "pace": "realtime",          // "realtime" | "asap" (default)
-    "max_decode_frames": 50       // 50≈2.0s; try 36–45 on smaller GPUs
-  }
-}
-```
-
-### Server events (server → client)
-- `{"type":"started","mode":"rt"}` – handshake
-- `{"type":"chunk","audio_base64":"…","metadata":{…}}` – base64 WAV
-  - `metadata.sample_rate` *(int)* – usually 48000
-  - `metadata.chunk_frames` *(int)* – e.g., 50
-  - `metadata.chunk_seconds` *(float)* – frames / 25.0
-  - `metadata.crossfade_seconds` *(float)* – typically 0.04
-- `{"type":"chunk_meta","metadata":{…}}` – sent **after** a binary frame when `binary_audio=true`
-- `{"type":"status",…}`, `{"type":"error",…}`, `{"type":"stopped"}`
-
-### Update (client → server)
-```jsonc
-{
-  "type": "update",
-  "styles": "jazz, hiphop",
-  "style_weights": "1.0,0.8",
-  "temperature": 1.2,
-  "topk": 64,
-  "guidance_weight": 1.0,
-  "pace": "realtime",            // optional live flip
-  "max_decode_frames": 40         // optional; <= 50
-}
-```
-
-### Stop / ping
-```json
-{"type":"stop"}
-{"type":"ping"}
-```
-
-### Browser quick‑start (schedules seamlessly with 25–40 ms crossfade)
-```html
-<script>
-const XFADE = 0.025; // 25 ms
-let ctx, gain, ws, nextTime = 0;
-async function start(){
-  ctx = new (window.AudioContext||window.webkitAudioContext)();
-  gain = ctx.createGain(); gain.connect(ctx.destination);
-  ws = new WebSocket("wss://YOUR_SPACE/ws/jam");
-  ws.onopen = ()=> ws.send(JSON.stringify({
-    type:"start", mode:"rt", binary_audio:false,
-    params:{ styles:"warmup", temperature:1.1, topk:40, guidance_weight:1.1, pace:"realtime" }
-  }));
-  ws.onmessage = async ev => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "chunk" && msg.audio_base64){
-      const bin = atob(msg.audio_base64); const buf = new Uint8Array(bin.length);
-      for (let i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
-      const ab = buf.buffer; const audio = await ctx.decodeAudioData(ab);
-      const src = ctx.createBufferSource(); const g = ctx.createGain();
-      src.buffer = audio; src.connect(g); g.connect(gain);
-      if (nextTime < ctx.currentTime + 0.05) nextTime = ctx.currentTime + 0.12;
-      const startAt = nextTime, dur = audio.duration;
-      nextTime = startAt + Math.max(0, dur - XFADE);
-      g.gain.setValueAtTime(0, startAt);
-      g.gain.linearRampToValueAtTime(1, startAt + XFADE);
-      g.gain.setValueAtTime(1, startAt + Math.max(0, dur - XFADE));
-      g.gain.linearRampToValueAtTime(0, startAt + dur);
-      src.start(startAt);
-    }
-  };
-}
-</script>
-```
-
-### Python client (async)
-```python
-import asyncio, json, websockets, base64, soundfile as sf, io
-async def run(url):
-  async with websockets.connect(url) as ws:
-    await ws.send(json.dumps({"type":"start","mode":"rt","binary_audio":False,
-      "params": {"styles":"warmup","temperature":1.1,"topk":40,"guidance_weight":1.1,"pace":"realtime"}}))
-    while True:
-      msg = json.loads(await ws.recv())
-      if msg.get("type") == "chunk":
-        wav = base64.b64decode(msg["audio_base64"])  # bytes of a WAV
-        x, sr = sf.read(io.BytesIO(wav), dtype="float32")
-        print("chunk", x.shape, sr)
-      elif msg.get("type") in ("stopped","error"): break
-asyncio.run(run("wss://YOUR_SPACE/ws/jam"))
-```
-                    """
-                )
-
-            # ------------------------------------------------------------------
-            # Performance & hardware guidance
-            # ------------------------------------------------------------------
-            with gr.Tab("📊 Performance & Hardware"):
-                gr.Markdown(
-                    r"""
-### Current observations
-- **L40S 48GB** → faster than realtime. Use `pace:"realtime"` to avoid client over‑buffering.
-- **L4 24GB** → slightly **below** realtime even with pre‑roll buffering, TF32/Autotune, smaller chunks (`max_decode_frames`), and the **base** checkpoint.
-
-### Practical guidance
-- For consistent realtime, target **~40GB VRAM per active stream** (e.g., **A100 40GB**, or MIG slices ≈ **35–40GB** on newer GPUs).
-- Keep client‑side **overlap‑add** (25–40 ms) for seamless chunk joins.
-- Prefer **`pace:"realtime"`** once playback begins; use **ASAP** only to build a short pre‑roll if needed.
-- Optional knob: **`max_decode_frames`** (default **50** ≈ 2.0 s). Reducing to **36–45** can lower per‑chunk latency/VRAM, but doesn’t increase frames/sec throughput.
-
-### Concurrency
-This research build is designed for **one active jam per GPU**. Concurrency would require GPU partitioning (MIG) or horizontal scaling with a session scheduler.
-                    """
-                )
-
-            # ------------------------------------------------------------------
-            # Changelog & legal
-            # ------------------------------------------------------------------
-            with gr.Tab("🗒️ Changelog & Legal"):
-                gr.Markdown(
-                    r"""
-### Recent changes
-- New **WebSocket realtime** route: `/ws/jam` (`mode:"rt"`)
-- Added server pacing flag: `pace: "realtime" | "asap"`
-- Exposed `max_decode_frames` for shorter chunks on smaller GPUs
-- Client test page now does proper **overlap‑add** crossfade between chunks
-
-### Licensing
-This project uses MagentaRT under:
-- **Code:** Apache 2.0
-- **Model weights:** CC‑BY 4.0
-Please review the MagentaRT repo for full terms.
-                    """
-                )
-
-        gr.Markdown(
-            r"""
----
-**🔬 Research Project** | **📱 iOS/Web Development** | **🎵 Powered by MagentaRT**
-            """
-        )
-
-    return interface
-
 jam_registry: dict[str, JamWorker] = {}
 jam_lock = threading.Lock()
 
@@ -561,170 +327,6 @@ try:
     _HAS_LOUDNORM = True
 except Exception:
     _HAS_LOUDNORM = False
-
-# # ----------------------------
-# # Main generation (single combined style vector)
-# # ----------------------------
-# def generate_loop_continuation_with_mrt(
-#     mrt,
-#     input_wav_path: str,
-#     bpm: float,
-#     extra_styles=None,
-#     style_weights=None,
-#     bars: int = 8,
-#     beats_per_bar: int = 4,
-#     loop_weight: float = 1.0,
-#     loudness_mode: str = "auto",
-#     loudness_headroom_db: float = 1.0,
-#     intro_bars_to_drop: int = 0,             # <— NEW
-# ):
-#     # Load & prep (unchanged)
-#     loop = au.Waveform.from_file(input_wav_path).resample(mrt.sample_rate).as_stereo()
-
-#     # Use tail for context (your recent change)
-#     codec_fps   = float(mrt.codec.frame_rate)
-#     ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
-#     loop_for_context = take_bar_aligned_tail(loop, bpm, beats_per_bar, ctx_seconds)
-
-#     tokens_full = mrt.codec.encode(loop_for_context).astype(np.int32)
-#     tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
-
-#     # Bar-aligned token window (unchanged)
-#     context_tokens = make_bar_aligned_context(
-#         tokens, bpm=bpm, fps=float(mrt.codec.frame_rate),
-#         ctx_frames=mrt.config.context_length_frames, beats_per_bar=beats_per_bar
-#     )
-#     state = mrt.init_state()
-#     state.context_tokens = context_tokens
-
-#     # STYLE embed (optional: switch to loop_for_context if you want stronger “recent” bias)
-#     loop_embed = mrt.embed_style(loop_for_context)
-#     embeds, weights = [loop_embed], [float(loop_weight)]
-#     if extra_styles:
-#         for i, s in enumerate(extra_styles):
-#             if s.strip():
-#                 embeds.append(mrt.embed_style(s.strip()))
-#                 w = style_weights[i] if (style_weights and i < len(style_weights)) else 1.0
-#                 weights.append(float(w))
-#     wsum = float(sum(weights)) or 1.0
-#     weights = [w / wsum for w in weights]
-#     combined_style = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(loop_embed.dtype)
-
-#     # --- Length math ---
-#     seconds_per_bar = beats_per_bar * (60.0 / bpm)
-#     total_secs      = bars * seconds_per_bar
-#     drop_bars       = max(0, int(intro_bars_to_drop))
-#     drop_secs       = min(drop_bars, bars) * seconds_per_bar       # clamp to <= bars
-#     gen_total_secs  = total_secs + drop_secs                       # generate extra
-
-#     # Chunk scheduling to cover gen_total_secs
-#     chunk_secs = mrt.config.chunk_length_frames * mrt.config.frame_length_samples / mrt.sample_rate  # ~2.0
-#     steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1  # pad then trim
-
-#     # Generate
-#     chunks = []
-#     for _ in range(steps):
-#         wav, state = mrt.generate_chunk(state=state, style=combined_style)
-#         chunks.append(wav)
-
-#     # Stitch continuous audio
-#     stitched = stitch_generated(chunks, mrt.sample_rate, mrt.config.crossfade_length).as_stereo()
-
-#     # Trim to generated length (bars + dropped bars)
-#     stitched = hard_trim_seconds(stitched, gen_total_secs)
-
-#     # 👉 Drop the intro bars
-#     if drop_secs > 0:
-#         n_drop = int(round(drop_secs * stitched.sample_rate))
-#         stitched = au.Waveform(stitched.samples[n_drop:], stitched.sample_rate)
-
-#     # Final exact-length trim to requested bars
-#     out = hard_trim_seconds(stitched, total_secs)
-
-#     # Final polish AFTER drop
-#     out = out.peak_normalize(0.95)
-#     apply_micro_fades(out, 5)
-
-#     # Loudness match to input (after drop) so bar 1 sits right
-#     out, loud_stats = match_loudness_to_reference(
-#         ref=loop, target=out,
-#         method=loudness_mode, headroom_db=loudness_headroom_db
-#     )
-
-#     return out, loud_stats
-
-# # untested.
-# # not sure how it will retain the input bpm. we may want to use a metronome instead of silence. i think google might do that.
-# # does a generation with silent context rather than a combined loop
-# def generate_style_only_with_mrt(
-#     mrt,
-#     bpm: float,
-#     bars: int = 8,
-#     beats_per_bar: int = 4,
-#     styles: str = "warmup",
-#     style_weights: str = "",
-#     intro_bars_to_drop: int = 0,
-# ):
-#     """
-#     Style-only, bar-aligned generation using a silent context (no input audio).
-#     Returns: (au.Waveform out, dict loud_stats_or_None)
-#     """
-#     # ---- Build a 10s silent context, tokenized for the model ----
-#     codec_fps   = float(mrt.codec.frame_rate)
-#     ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
-#     sr          = int(mrt.sample_rate)
-
-#     silent = au.Waveform(np.zeros((int(round(ctx_seconds * sr)), 2), np.float32), sr)
-#     tokens_full = mrt.codec.encode(silent).astype(np.int32)
-#     tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
-
-#     state = mrt.init_state()
-#     state.context_tokens = tokens
-
-#     # ---- Style vector (text prompts only, normalized weights) ----
-#     prompts = [s.strip() for s in (styles.split(",") if styles else []) if s.strip()]
-#     if not prompts:
-#         prompts = ["warmup"]
-#     sw = [float(x) for x in style_weights.split(",")] if style_weights else []
-#     embeds, weights = [], []
-#     for i, p in enumerate(prompts):
-#         embeds.append(mrt.embed_style(p))
-#         weights.append(sw[i] if i < len(sw) else 1.0)
-#     wsum = float(sum(weights)) or 1.0
-#     weights = [w / wsum for w in weights]
-#     style_vec = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
-
-#     # ---- Target length math ----
-#     seconds_per_bar = beats_per_bar * (60.0 / bpm)
-#     total_secs      = bars * seconds_per_bar
-#     drop_bars       = max(0, int(intro_bars_to_drop))
-#     drop_secs       = min(drop_bars, bars) * seconds_per_bar
-#     gen_total_secs  = total_secs + drop_secs
-
-#     # ~2.0s chunk length from model config
-#     chunk_secs = (mrt.config.chunk_length_frames * mrt.config.frame_length_samples) / float(mrt.sample_rate)
-
-#     # Generate enough chunks to cover total, plus a pad chunk for crossfade headroom
-#     steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1
-
-#     chunks = []
-#     for _ in range(steps):
-#         wav, state = mrt.generate_chunk(state=state, style=style_vec)
-#         chunks.append(wav)
-
-#     # Stitch & trim to exact musical length
-#     stitched = stitch_generated(chunks, mrt.sample_rate, mrt.config.crossfade_length).as_stereo()
-#     stitched = hard_trim_seconds(stitched, gen_total_secs)
-
-#     if drop_secs > 0:
-#         n_drop = int(round(drop_secs * stitched.sample_rate))
-#         stitched = au.Waveform(stitched.samples[n_drop:], stitched.sample_rate)
-
-#     out = hard_trim_seconds(stitched, total_secs)
-#     out = out.peak_normalize(0.95)
-#     apply_micro_fades(out, 5)
-
-#     return out, None  # loudness stats not applicable (no reference)
 
 def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
     extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
@@ -836,12 +438,13 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                ckpt_dir = _resolve_checkpoint_dir()  # ← points to checkpoint_1863001
+                from model_management import CheckpointManager
+                ckpt_dir = CheckpointManager.resolve_checkpoint_dir()  # ← Updated call
                 _MRT = system.MagentaRT(
-                    tag=os.getenv("MRT_SIZE", "large"),  # keep 'large' if finetuned from large
+                    tag=os.getenv("MRT_SIZE", "large"),
                     guidance_weight=5.0,
                     device="gpu",
-                    checkpoint_dir=ckpt_dir,             # ← uses your finetune
+                    checkpoint_dir=ckpt_dir,
                     lazy=False,
                 )
     return _MRT
@@ -948,7 +551,12 @@ def model_swap(step: int = Form(...)):
 
 @app.post("/model/assets/load")
 def model_assets_load(repo_id: str = Form(None)):
-    ok, msg = _load_finetune_assets_from_hf(repo_id)
+    global _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID
+    ok, msg = asset_manager.load_finetune_assets_from_hf(repo_id, get_mrt())
+    # Sync globals after loading
+    _MEAN_EMBED = asset_manager.mean_embed
+    _CENTROIDS = asset_manager.centroids
+    _ASSETS_REPO_ID = asset_manager.assets_repo_id
     return {"ok": ok, "message": msg, "repo_id": _ASSETS_REPO_ID,
             "mean": _MEAN_EMBED is not None,
             "centroids": None if _CENTROIDS is None else int(_CENTROIDS.shape[0])}
@@ -987,15 +595,14 @@ def model_config():
     step   = os.getenv("MRT_CKPT_STEP")
     assets = os.getenv("MRT_ASSETS_REPO")
 
-    # Best-effort local cache probe (no network)
-    def _local_ckpt_dir(step_str: str | None) -> str | None:
-        if not step_str:
-            return None
+    # Use CheckpointManager for local cache probe (no network)
+    local_ckpt = None
+    if step:
         try:
             from pathlib import Path
             import re
-            step = re.escape(str(step_str))
-            candidates: list[str] = []
+            step_escaped = re.escape(str(step))
+            candidates = []
             for root in ("/home/appuser/.cache/mrt_ckpt/extracted",
                          "/home/appuser/.cache/mrt_ckpt/repo"):
                 p = Path(root)
@@ -1005,11 +612,9 @@ def model_config():
                 for d in p.rglob(f"checkpoint_{step}"):
                     if d.is_dir():
                         candidates.append(str(d))
-            return candidates[0] if candidates else None
+            local_ckpt = candidates[0] if candidates else None
         except Exception:
-            return None
-
-    local_ckpt = _local_ckpt_dir(step)
+            local_ckpt = None
 
     return {
         "size": size,
@@ -1032,160 +637,89 @@ def model_config():
 
 @app.get("/model/checkpoints")
 def model_checkpoints(repo_id: str, revision: str = "main"):
-    steps = _list_ckpt_steps(repo_id, revision)
+    steps = CheckpointManager.list_ckpt_steps(repo_id, revision)
     return {"repo": repo_id, "revision": revision, "steps": steps, "latest": (steps[-1] if steps else None)}
 
-class ModelSelect(BaseModel):
-    size: Optional[Literal["base","large"]] = None
-    repo_id: Optional[str] = None
-    revision: Optional[str] = "main"
-    step: Optional[Union[int, str]] = None   # allow "latest"
-    assets_repo_id: Optional[str] = None     # default: follow repo_id
-    sync_assets: bool = True                 # load mean/centroids from repo
-    prewarm: bool = False                    # call get_mrt() to build right away
-    stop_active: bool = True                 # auto-stop jams; else 409
-    dry_run: bool = False                    # validate only, don't swap
+# class ModelSelect(BaseModel):
+#     size: Optional[Literal["base","large"]] = None
+#     repo_id: Optional[str] = None
+#     revision: Optional[str] = "main"
+#     step: Optional[Union[int, str]] = None   # allow "latest"
+#     assets_repo_id: Optional[str] = None     # default: follow repo_id
+#     sync_assets: bool = True                 # load mean/centroids from repo
+#     prewarm: bool = False                    # call get_mrt() to build right away
+#     stop_active: bool = True                 # auto-stop jams; else 409
+#     dry_run: bool = False                    # validate only, don't swap
 
 @app.post("/model/select")
 def model_select(req: ModelSelect):
-    # --- Current env defaults ---
-    global _MRT
-    cur = {
-        "size":    os.getenv("MRT_SIZE", "large"),
-        "repo":    os.getenv("MRT_CKPT_REPO"),
-        "rev":     os.getenv("MRT_CKPT_REV", "main"),
-        "step":    os.getenv("MRT_CKPT_STEP"),
-        "assets":  os.getenv("MRT_ASSETS_REPO", _FINETUNE_REPO_DEFAULT),
-    }
-
-    # --- Flags for special step values ---
-    no_ckpt = isinstance(req.step, str) and req.step.lower() == "none"
-    latest  = isinstance(req.step, str) and req.step.lower() == "latest"
-
-    # --- Target selection (do not require repo when no_ckpt) ---
-    tgt = {
-        "size":   (req.size or cur["size"]),
-        "repo":   (None if no_ckpt else (req.repo_id or cur["repo"])),
-        "rev":    (req.revision if req.revision is not None else cur["rev"]),
-        # None => resolve to "latest" below. Keep None for no_ckpt as well.
-        "step":   (None if (no_ckpt or latest) else (str(req.step) if req.step is not None else cur["step"])),
-        "assets": (req.assets_repo_id or req.repo_id or cur["assets"]),
-    }
-
-    # ---------- CASE 1: run with NO FINETUNE (stock base/large) ----------
-    if no_ckpt:
-        preview = {
-            "target_size": tgt["size"],
-            "target_repo": None,
-            "target_revision": None,
-            "target_step": None,
-            "assets_repo": None,
-            "assets_probe": {"ok": True, "message": "skipped"},
-            "active_jam": _any_jam_running(),
-        }
-        if req.dry_run:
-            return {"ok": True, "dry_run": True, **preview}
-
-        # Jam policy
-        if _any_jam_running():
-            if req.stop_active:
-                _stop_all_jams()
-            else:
-                raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
-
-        # Clear checkpoint + asset env so get_mrt() uses stock weights
-        for k in ("MRT_CKPT_REPO", "MRT_CKPT_REV", "MRT_CKPT_STEP", "MRT_ASSETS_REPO"):
-            os.environ.pop(k, None)
-        os.environ["MRT_SIZE"] = str(tgt["size"])
-
-        # Rebuild model and optionally prewarm
-        
-        with _MRT_LOCK:
-            _MRT = None
-        if req.prewarm:
-            get_mrt()
-
-        return {"ok": True, **preview}
-
-    # ---------- CASE 2: select a repo + step (supports "latest") ----------
-    if not tgt["repo"]:
-        raise HTTPException(status_code=400, detail="repo_id is required for model selection.")
-
-    # 1) enumerate available steps
-    steps = _list_ckpt_steps(tgt["repo"], tgt["rev"])
-    if not steps:
-        return {"ok": False, "error": f"No checkpoint files found in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
-
-    # 2) choose step (explicit or latest)
-    chosen_step = int(tgt["step"]) if tgt["step"] is not None else steps[-1]
-    if chosen_step not in steps:
-        return {"ok": False, "error": f"checkpoint_{chosen_step} not present in {tgt['repo']}@{tgt['rev']}", "discovered_steps": steps}
-
-    # 3) optional finetune assets probe (no downloads, just listing)
-    assets_ok, assets_msg = True, "skipped"
-    if req.sync_assets:
-        try:
-            api = HfApi()
-            files = set(api.list_repo_files(repo_id=tgt["assets"], repo_type="model"))
-            if ("mean_style_embed.npy" not in files) and ("cluster_centroids.npy" not in files):
-                assets_ok, assets_msg = False, f"No finetune asset files in {tgt['assets']}"
-            else:
-                assets_msg = "found"
-        except Exception as e:
-            assets_ok, assets_msg = False, f"probe failed: {e}"
-
-    preview = {
-        "target_size": tgt["size"],
-        "target_repo": tgt["repo"],
-        "target_revision": tgt["rev"],
-        "target_step": chosen_step,
-        "assets_repo": (tgt["assets"] if req.sync_assets else None),
-        "assets_probe": {"ok": assets_ok, "message": assets_msg},
-        "active_jam": _any_jam_running(),
-    }
-
+    global _MRT, _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID
+    
+    # Use ModelSelector to validate the request
+    success, validation_result = model_selector.validate_selection(req)
+    if not success:
+        if "error" in validation_result:
+            raise HTTPException(status_code=400, detail=validation_result["error"])
+        return {"ok": False, **validation_result}
+    
+    # Add active_jam status to the validation result
+    validation_result["active_jam"] = _any_jam_running()
+    
+    # If dry run, return the validation result
     if req.dry_run:
-        return {"ok": True, "dry_run": True, **preview}
+        return {"ok": True, "dry_run": True, **validation_result}
 
-    # Jam policy
+    # Handle jam policy
     if _any_jam_running():
         if req.stop_active:
             _stop_all_jams()
         else:
             raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
 
-    # 4) atomic swap with rollback
+    # Prepare environment changes
+    env_changes = model_selector.prepare_env_changes(req, validation_result)
+    
+    # Save current environment for rollback
     old_env = {
-        "MRT_SIZE":         os.getenv("MRT_SIZE"),
-        "MRT_CKPT_REPO":    os.getenv("MRT_CKPT_REPO"),
-        "MRT_CKPT_REV":     os.getenv("MRT_CKPT_REV"),
-        "MRT_CKPT_STEP":    os.getenv("MRT_CKPT_STEP"),
-        "MRT_ASSETS_REPO":  os.getenv("MRT_ASSETS_REPO"),
+        "MRT_SIZE": os.getenv("MRT_SIZE"),
+        "MRT_CKPT_REPO": os.getenv("MRT_CKPT_REPO"),
+        "MRT_CKPT_REV": os.getenv("MRT_CKPT_REV"),
+        "MRT_CKPT_STEP": os.getenv("MRT_CKPT_STEP"),
+        "MRT_ASSETS_REPO": os.getenv("MRT_ASSETS_REPO"),
     }
+    
     try:
-        os.environ["MRT_SIZE"]      = str(tgt["size"])
-        os.environ["MRT_CKPT_REPO"] = str(tgt["repo"])
-        os.environ["MRT_CKPT_REV"]  = str(tgt["rev"])
-        os.environ["MRT_CKPT_STEP"] = str(chosen_step)
-        if req.sync_assets:
-            os.environ["MRT_ASSETS_REPO"] = str(tgt["assets"])
+        # Apply environment changes atomically
+        for key, value in env_changes.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
 
-        # force rebuild
-        
+        # Force model rebuild
         with _MRT_LOCK:
             _MRT = None
 
-        # optionally load finetune assets now
-        if req.sync_assets:
-            _load_finetune_assets_from_hf(os.getenv("MRT_ASSETS_REPO"))
+        # Load finetune assets if requested
+        if req.sync_assets and validation_result.get("assets_repo"):
+            ok, msg = asset_manager.load_finetune_assets_from_hf(
+                validation_result["assets_repo"], 
+                get_mrt() if req.prewarm else None
+            )
+            if ok:
+                # Sync globals after successful asset loading
+                _MEAN_EMBED = asset_manager.mean_embed
+                _CENTROIDS = asset_manager.centroids
+                _ASSETS_REPO_ID = asset_manager.assets_repo_id
 
-        # optional prewarm to amortize JIT
+        # Optional prewarm to amortize JIT
         if req.prewarm:
             get_mrt()
 
-        return {"ok": True, **preview}
+        return {"ok": True, **validation_result}
+        
     except Exception as e:
-        # rollback on error
+        # Rollback on error
         for k, v in old_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1193,6 +727,7 @@ def model_select(req: ModelSelect):
                 os.environ[k] = v
         with _MRT_LOCK:
             _MRT = None
+        # Try to restore working state
         try:
             get_mrt()
         except Exception:
@@ -1379,7 +914,7 @@ def jam_start(
     topk: int = Form(40),
     target_sample_rate: int | None = Form(None),
 ):
-    _ensure_assets_loaded()
+    asset_manager.ensure_assets_loaded(get_mrt())
 
     # enforce single active jam per GPU
     with jam_lock:
@@ -1534,7 +1069,7 @@ def jam_update(
     mean: Optional[float]            = Form(None),
     centroid_weights: str            = Form(""),
 ):
-    _ensure_assets_loaded()
+    asset_manager.ensure_assets_loaded(get_mrt())
 
     with jam_lock:
         worker = jam_registry.get(session_id)
@@ -1842,7 +1377,7 @@ async def ws_jam(websocket: WebSocket):
                         state.context_tokens = tokens
 
                         # Parse params (including steering)
-                        _ensure_assets_loaded()
+                        asset_manager.ensure_assets_loaded(get_mrt())
                         styles_str        = params.get("styles", "warmup") or ""
                         style_weights_str = params.get("style_weights", "") or ""
                         mean_w            = float(params.get("mean", 0.0) or 0.0)
@@ -2009,7 +1544,7 @@ async def ws_jam(websocket: WebSocket):
                     text_list = [s for s in (styles_str.split(",") if styles_str else []) if s.strip()]
                     text_w = [float(x) for x in style_weights_str.split(",")] if style_weights_str else []
 
-                    _ensure_assets_loaded()
+                    asset_manager.ensure_assets_loaded(get_mrt())
                     websocket._style_tgt = build_style_vector(
                         websocket._mrt,
                         text_styles=text_list,
@@ -2117,38 +1652,3 @@ def read_root():
         </body></html>
         """
     return Response(content=html_content, media_type="text/html")
-
-def load_doc_content(filename: str) -> str:
-    """Load markdown content from docs directory, with fallback."""
-    try:
-        doc_path = Path(__file__).parent / "docs" / filename
-        return doc_path.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return f"⚠️ Documentation file `{filename}` not found. Please check the docs directory."
-    except Exception as e:
-        return f"⚠️ Error loading `{filename}`: {e}"
-
-@app.get("/documentation")
-def documentation():
-    # Just return a simple combined markdown page
-    all_content = f"""
-# MagentaRT Documentation
-
-## About & Status
-{load_doc_content("about_status.md")}
-
-## HTTP API  
-{load_doc_content("api_http.md")}
-
-## WebSocket API
-{load_doc_content("api_websocket.md")}
-
-## Performance
-{load_doc_content("performance.md")}
-
-## Changelog
-{load_doc_content("changelog.md")}
-    """
-    
-    # Convert markdown to HTML if you want, or just serve as plain text
-    return Response(content=all_content, media_type="text/plain")
