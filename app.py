@@ -498,33 +498,37 @@ def model_checkpoints(repo_id: str, revision: str = "main"):
 
 @app.post("/model/select")
 def model_select(req: ModelSelect):
-    global _MRT, _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID
-    
-    # Use ModelSelector to validate the request
+    """
+    Swap model/checkpoint/assets. If req.prewarm is True, run the full bar-aligned warmup
+    (_mrt_warmup) synchronously so we only report warmed once the new model is actually ready.
+    """
+    global _MRT, _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID, _WARMED
+
+    # 1) Validate the request (no side-effects)
     success, validation_result = model_selector.validate_selection(req)
     if not success:
         if "error" in validation_result:
             raise HTTPException(status_code=400, detail=validation_result["error"])
         return {"ok": False, **validation_result}
-    
-    # Add active_jam status to the validation result
+
+    # Augment response surface
     validation_result["active_jam"] = _any_jam_running()
-    
-    # If dry run, return the validation result
+
+    # Dry-run path
     if req.dry_run:
         return {"ok": True, "dry_run": True, **validation_result}
 
-    # Handle jam policy
+    # 2) Handle jam policy
     if _any_jam_running():
         if req.stop_active:
             _stop_all_jams()
         else:
             raise HTTPException(status_code=409, detail="A jam is running; retry with stop_active=true")
 
-    # Prepare environment changes
+    # 3) Compute environment changes (no mutation yet)
     env_changes = model_selector.prepare_env_changes(req, validation_result)
-    
-    # Save current environment for rollback
+
+    # Keep current env for rollback
     old_env = {
         "MRT_SIZE": os.getenv("MRT_SIZE"),
         "MRT_CKPT_REPO": os.getenv("MRT_CKPT_REPO"),
@@ -532,52 +536,64 @@ def model_select(req: ModelSelect):
         "MRT_CKPT_STEP": os.getenv("MRT_CKPT_STEP"),
         "MRT_ASSETS_REPO": os.getenv("MRT_ASSETS_REPO"),
     }
-    
+
     try:
-        # Apply environment changes atomically
+        # 4) Apply env atomically
         for key, value in env_changes.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = str(value)
 
-        # Force model rebuild
+        # 5) Force rebuild of the model and reset warmup state
         with _MRT_LOCK:
             _MRT = None
+        with _WARMUP_LOCK:
+            _WARMED = False  # ← critical: don't leak previous model's warmed state
 
-        # Load finetune assets if requested
+        # 6) Load finetune assets if requested (mean/centroids)
         if req.sync_assets and validation_result.get("assets_repo"):
             ok, msg = asset_manager.load_finetune_assets_from_hf(
-                validation_result["assets_repo"], 
-                get_mrt() if req.prewarm else None
+                validation_result["assets_repo"],
+                None  # don't implicitly instantiate model here; we'll do it below
             )
             if ok:
-                # Sync globals after successful asset loading
                 _MEAN_EMBED = asset_manager.mean_embed
                 _CENTROIDS = asset_manager.centroids
                 _ASSETS_REPO_ID = asset_manager.assets_repo_id
+            else:
+                logging.warning("Asset sync skipped/failed: %s", msg)
 
-        # Optional prewarm to amortize JIT
+        # 7) Prewarm behavior:
+        #    - If prewarm=True, run the *real* bar-aligned warmup synchronously.
+        #    - This will instantiate the new MRT and set _WARMED=True on success.
         if req.prewarm:
-            get_mrt()
+            _mrt_warmup()  # builds MRT internally via get_mrt(), runs generate_chunk, sets _WARMED
 
-        return {"ok": True, **validation_result}
-        
+        # Optional: if you want to always ensure MRT exists (even without prewarm), uncomment:
+        # else:
+        #     _ = get_mrt()
+
+        return {
+            "ok": True,
+            **validation_result,
+            "warmup_done": bool(_WARMED),
+        }
+
     except Exception as e:
-        # Rollback on error
+        # 8) Roll back env on failure
         for k, v in old_env.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # Also reset model pointer & warmed flag to a safe state
         with _MRT_LOCK:
             _MRT = None
-        # Try to restore working state
-        try:
-            get_mrt()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"Swap failed: {e}")
+        with _WARMUP_LOCK:
+            _WARMED = False
+        logging.exception("Model select failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Model select failed: {e}")
     
 
 
