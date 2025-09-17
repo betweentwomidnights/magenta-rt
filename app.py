@@ -1,7 +1,15 @@
 import os
 
 # ---- Space mode gating (place above any JAX import!) ----
-SPACE_MODE = os.getenv("SPACE_MODE", "serve")  # "serve" | "template"
+SPACE_MODE = os.getenv("SPACE_MODE")
+if SPACE_MODE is None:
+    try:
+        import jax
+        SPACE_MODE = "serve" if any(getattr(d, "platform", "") in ("gpu","cuda","rocm") for d in jax.devices()) else "template"
+    except Exception:
+        SPACE_MODE = "template"
+
+
 
 if SPACE_MODE != "serve":
     # In template mode, force JAX to CPU so it won't try to load CUDA plugins
@@ -40,7 +48,8 @@ except Exception:
 
 from magenta_rt import system, audio as au
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
