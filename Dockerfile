@@ -146,7 +146,9 @@ COPY --chown=appuser:appuser one_shot_generation.py /home/appuser/app/one_shot_g
 
 COPY --chown=appuser:appuser model_management.py /home/appuser/app/model_management.py
 
-COPY --chown=appuser:appuser documentation.html /home/appuser/app/documentation.html
+COPY documentation.html /app/documentation.html
+
+COPY lil_demo_540p.mp4 /app/lil_demo_540p.mp4
 
 # Create docs directory and copy documentation files
 COPY --chown=appuser:appuser docs/ /home/appuser/app/docs/
