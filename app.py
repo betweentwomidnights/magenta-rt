@@ -77,45 +77,22 @@ from pydantic import BaseModel
 from model_management import CheckpointManager, AssetManager, ModelSelector, ModelSelect
 
 # ---- Finetune assets (mean & centroids) --------------------------------------
-_FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
+# _FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
 _ASSETS_REPO_ID: str | None = None
 _MEAN_EMBED: np.ndarray | None = None           # shape (D,) dtype float32
 _CENTROIDS: np.ndarray | None = None            # shape (K, D) dtype float32
 
-_STEP_RE = re.compile(r"(?:^|/)checkpoint_(\d+)(?:/|\.tar\.gz|\.tgz)?$")
+# _STEP_RE = re.compile(r"(?:^|/)checkpoint_(\d+)(?:/|\.tar\.gz|\.tgz)?$")
 
 # Create instances (these don't modify globals)
 asset_manager = AssetManager()
 model_selector = ModelSelector(CheckpointManager(), asset_manager)
 
 # Sync asset manager with existing globals
-def _sync_asset_manager():
-    asset_manager.mean_embed = _MEAN_EMBED
-    asset_manager.centroids = _CENTROIDS  
-    asset_manager.assets_repo_id = _ASSETS_REPO_ID
-
-# def _list_ckpt_steps(repo_id: str, revision: str = "main") -> list[int]:
-#     """
-#     List available checkpoint steps in a HF model repo without downloading all weights.
-#     Looks for:
-#       checkpoint_<step>/
-#       checkpoint_<step>.tgz | .tar.gz
-#       archives/checkpoint_<step>.tgz | .tar.gz
-#     """
-#     api = HfApi()
-#     files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
-#     steps = set()
-#     for f in files:
-#         m = _STEP_RE.search(f)
-#         if m:
-#             try:
-#                 steps.add(int(m.group(1)))
-#             except:
-#                 pass
-#     return sorted(steps)
-
-# def _step_exists(repo_id: str, revision: str, step: int) -> bool:
-#     return step in _list_ckpt_steps(repo_id, revision)
+# def _sync_asset_manager():
+#     asset_manager.mean_embed = _MEAN_EMBED
+#     asset_manager.centroids = _CENTROIDS  
+#     asset_manager.assets_repo_id = _ASSETS_REPO_ID
 
 def _any_jam_running() -> bool:
     with jam_lock:
@@ -128,132 +105,6 @@ def _stop_all_jams(timeout: float = 5.0):
                 w.stop()
                 w.join(timeout=timeout)
                 jam_registry.pop(sid, None)
-
-# def _load_finetune_assets_from_hf(repo_id: str | None) -> tuple[bool, str]:
-#     """
-#     Download & load mean_style_embed.npy and cluster_centroids.npy from a HF model repo.
-#     Safe to call multiple times; will overwrite globals if successful.
-#     """
-#     global _ASSETS_REPO_ID, _MEAN_EMBED, _CENTROIDS
-#     repo_id = repo_id or _FINETUNE_REPO_DEFAULT
-#     try:
-#         from huggingface_hub import hf_hub_download
-#         mean_path = None
-#         cent_path = None
-#         try:
-#             mean_path = hf_hub_download(repo_id, filename="mean_style_embed.npy", repo_type="model")
-#         except Exception:
-#             pass
-#         try:
-#             cent_path = hf_hub_download(repo_id, filename="cluster_centroids.npy", repo_type="model")
-#         except Exception:
-#             pass
-
-#         if mean_path is None and cent_path is None:
-#             return False, f"No finetune asset files found in repo {repo_id}"
-
-#         if mean_path is not None:
-#             m = np.load(mean_path)
-#             if m.ndim != 1:
-#                 return False, f"mean_style_embed.npy must be 1-D (got {m.shape})"
-#         else:
-#             m = None
-
-#         if cent_path is not None:
-#             c = np.load(cent_path)
-#             if c.ndim != 2:
-#                 return False, f"cluster_centroids.npy must be 2-D (got {c.shape})"
-#         else:
-#             c = None
-
-#         # Optional: shape check vs model embedding dim once model is alive
-#         try:
-#             d = int(get_mrt().style_model.config.embedding_dim)
-#             if m is not None and m.shape[0] != d:
-#                 return False, f"mean_style_embed dim {m.shape[0]} != model dim {d}"
-#             if c is not None and c.shape[1] != d:
-#                 return False, f"cluster_centroids dim {c.shape[1]} != model dim {d}"
-#         except Exception:
-#             # Model not built yet; we’ll trust the files and rely on runtime checks later
-#             pass
-
-#         _MEAN_EMBED = m.astype(np.float32, copy=False) if m is not None else None
-#         _CENTROIDS = c.astype(np.float32, copy=False) if c is not None else None
-#         _ASSETS_REPO_ID = repo_id
-#         logging.info("Loaded finetune assets from %s (mean=%s, centroids=%s)",
-#                      repo_id,
-#                      "yes" if _MEAN_EMBED is not None else "no",
-#                      f"{_CENTROIDS.shape[0]}x{_CENTROIDS.shape[1]}" if _CENTROIDS is not None else "no")
-#         return True, "ok"
-#     except Exception as e:
-#         logging.exception("Failed to load finetune assets: %s", e)
-#         return False, str(e)
-
-# def _ensure_assets_loaded():
-#     # Best-effort lazy load if nothing is loaded yet
-#     if _MEAN_EMBED is None and _CENTROIDS is None:
-#         _load_finetune_assets_from_hf(_ASSETS_REPO_ID or _FINETUNE_REPO_DEFAULT)
-# ------------------------------------------------------------------------------
-
-# def _resolve_checkpoint_dir() -> str | None:
-#     repo_id = os.getenv("MRT_CKPT_REPO")
-#     if not repo_id:
-#         return None
-#     step = os.getenv("MRT_CKPT_STEP")  # e.g. "1863001"
-
-#     root = Path(snapshot_download(
-#         repo_id=repo_id,
-#         repo_type="model",
-#         revision=os.getenv("MRT_CKPT_REV", "main"),
-#         local_dir="/home/appuser/.cache/mrt_ckpt/repo",
-#         local_dir_use_symlinks=False,
-#     ))
-
-#     # Prefer an archive if present (more reliable for Zarr/T5X)
-#     arch_names = [
-#         f"checkpoint_{step}.tgz",
-#         f"checkpoint_{step}.tar.gz",
-#         f"archives/checkpoint_{step}.tgz",
-#         f"archives/checkpoint_{step}.tar.gz",
-#     ] if step else []
-
-#     cache_root = Path("/home/appuser/.cache/mrt_ckpt/extracted")
-#     cache_root.mkdir(parents=True, exist_ok=True)
-#     for name in arch_names:
-#         arch = root / name
-#         if arch.is_file():
-#             out_dir = cache_root / f"checkpoint_{step}"
-#             marker = out_dir.with_suffix(".ok")
-#             if not marker.exists():
-#                 out_dir.mkdir(parents=True, exist_ok=True)
-#                 with tarfile.open(arch, "r:*") as tf:
-#                     tf.extractall(out_dir)
-#                 marker.write_text("ok")
-#             # sanity: require .zarray to exist inside the extracted tree
-#             if not any(out_dir.rglob(".zarray")):
-#                 raise RuntimeError(f"Extracted archive missing .zarray files: {out_dir}")
-#             return str(out_dir / f"checkpoint_{step}") if (out_dir / f"checkpoint_{step}").exists() else str(out_dir)
-
-#     # No archive; try raw folder from repo and sanity check.
-#     if step:
-#         raw = root / f"checkpoint_{step}"
-#         if raw.is_dir():
-#             if not any(raw.rglob(".zarray")):
-#                 raise RuntimeError(
-#                     f"Downloaded checkpoint_{step} appears incomplete (no .zarray). "
-#                     "Upload as a .tgz or push via git from a Unix shell."
-#                 )
-#             return str(raw)
-
-#     # Pick latest if no step
-#     step_dirs = [d for d in root.iterdir() if d.is_dir() and re.match(r"checkpoint_\\d+$", d.name)]
-#     if step_dirs:
-#         pick = max(step_dirs, key=lambda d: int(d.name.split('_')[-1]))
-#         if not any(pick.rglob(".zarray")):
-#             raise RuntimeError(f"Downloaded {pick} appears incomplete (no .zarray).")
-#         return str(pick)
-
-#     return None
 
 
 async def send_json_safe(ws: WebSocket, obj) -> bool:
@@ -328,19 +179,19 @@ try:
 except Exception:
     _HAS_LOUDNORM = False
 
-def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
-    extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
-    if not extra:
-        return mrt.embed_style("warmup")
-    sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
-    embeds, weights = [], []
-    for i, s in enumerate(extra):
-        embeds.append(mrt.embed_style(s))
-        weights.append(sw[i] if i < len(sw) else 1.0)
-    wsum = sum(weights) or 1.0
-    weights = [w/wsum for w in weights]
-    import numpy as np
-    return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+# def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
+#     extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
+#     if not extra:
+#         return mrt.embed_style("warmup")
+#     sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
+#     embeds, weights = [], []
+#     for i, s in enumerate(extra):
+#         embeds.append(mrt.embed_style(s))
+#         weights.append(sw[i] if i < len(sw) else 1.0)
+#     wsum = sum(weights) or 1.0
+#     weights = [w/wsum for w in weights]
+#     import numpy as np
+#     return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
 
 def build_style_vector(
     mrt,
@@ -518,6 +369,11 @@ def _mrt_warmup():
             # Never crash on warmup errors; log and continue serving
             logging.exception("MagentaRT warmup failed (continuing without warmup): %s", e)
 
+
+# ----------------------------
+# startup and model selection
+# ----------------------------
+
 # Kick it off in the background on server start
 @app.on_event("startup")
 def _kickoff_warmup():
@@ -640,17 +496,6 @@ def model_checkpoints(repo_id: str, revision: str = "main"):
     steps = CheckpointManager.list_ckpt_steps(repo_id, revision)
     return {"repo": repo_id, "revision": revision, "steps": steps, "latest": (steps[-1] if steps else None)}
 
-# class ModelSelect(BaseModel):
-#     size: Optional[Literal["base","large"]] = None
-#     repo_id: Optional[str] = None
-#     revision: Optional[str] = "main"
-#     step: Optional[Union[int, str]] = None   # allow "latest"
-#     assets_repo_id: Optional[str] = None     # default: follow repo_id
-#     sync_assets: bool = True                 # load mean/centroids from repo
-#     prewarm: bool = False                    # call get_mrt() to build right away
-#     stop_active: bool = True                 # auto-stop jams; else 409
-#     dry_run: bool = False                    # validate only, don't swap
-
 @app.post("/model/select")
 def model_select(req: ModelSelect):
     global _MRT, _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID
@@ -733,6 +578,12 @@ def model_select(req: ModelSelect):
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Swap failed: {e}")
+    
+
+
+# ----------------------------
+# one-shot generation
+# ----------------------------
 
 
 

@@ -4,67 +4,326 @@
   <meta charset="utf-8">
   <title>MagentaRT Research API</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 860px; margin: 48px auto; padding: 0 20px; color:#111; }
-    code, pre { background:#f6f8fa; border:1px solid #eaecef; border-radius:6px; padding:2px 6px; }
-    pre { padding:12px; overflow:auto; }
-    .muted { color:#555; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+      max-width: 900px; 
+      margin: 48px auto; 
+      padding: 0 24px; 
+      color: #111; 
+      line-height: 1.6;
+    }
+    .header { text-align: center; margin-bottom: 48px; }
+    .badge { 
+      display: inline-block; 
+      background: #ff6b35; 
+      color: white; 
+      padding: 4px 12px; 
+      border-radius: 16px; 
+      font-size: 0.85em; 
+      font-weight: 500;
+      margin-left: 8px;
+    }
+    code, pre { 
+      background: #f6f8fa; 
+      border: 1px solid #eaecef; 
+      border-radius: 6px; 
+      font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
+    }
+    code { padding: 2px 6px; }
+    pre { 
+      padding: 16px; 
+      overflow-x: auto; 
+      margin: 16px 0;
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: #0969da;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: #0550ae; }
+    .muted { color: #656d76; }
+    .warning { 
+      background: #fff8c5; 
+      border: 1px solid #e3b341; 
+      border-radius: 8px; 
+      padding: 16px; 
+      margin: 16px 0;
+    }
+    .info { 
+      background: #dbeafe; 
+      border: 1px solid #3b82f6; 
+      border-radius: 8px; 
+      padding: 16px; 
+      margin: 16px 0;
+    }
     ul { line-height: 1.8; }
+    .endpoint { 
+      background: #f8f9fa; 
+      border-left: 4px solid #0969da; 
+      padding: 12px 16px; 
+      margin: 12px 0;
+    }
+    .demo-placeholder {
+      background: #f6f8fa;
+      border: 2px dashed #d1d9e0;
+      border-radius: 8px;
+      padding: 48px;
+      text-align: center;
+      margin: 24px 0;
+      color: #656d76;
+    }
+    .grid { 
+      display: grid; 
+      grid-template-columns: 1fr 1fr; 
+      gap: 24px; 
+      margin: 24px 0;
+    }
+    .card {
+      background: #f8f9fa;
+      border: 1px solid #e1e8ed;
+      border-radius: 8px;
+      padding: 20px;
+    }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .section { margin: 48px 0; }
   </style>
 </head>
 <body>
-  <h1>🎵 MagentaRT Research API</h1>
-  <p class="muted"><strong>Purpose:</strong> AI music generation for iOS/web app research using Google's MagentaRT.</p>
+  <div class="header">
+    <h1>🎵 MagentaRT Research API</h1>
+    <p class="muted"><strong>AI Music Generation API</strong> • Real-time streaming • Custom fine-tuning support</p>
+    <span class="badge">Research Project</span>
+  </div>
 
-  <h2>Available Endpoints</h2>
-  <ul>
-    <li><code>POST /generate</code> – Generate 4–8 bars of music (HTTP, bar-aligned)</li>
-    <li><code>POST /jam/start</code> – Start continuous jamming (HTTP)</li>
-    <li><code>GET /jam/next</code> – Get next chunk (HTTP)</li>
-    <li><code>POST /jam/consume</code> – Confirm a chunk as consumed (HTTP)</li>
-    <li><code>POST /jam/stop</code> – End session (HTTP)</li>
-    <li><code>WEBSOCKET /ws/jam</code> – Realtime streaming (<code>mode="rt"</code>)</li>
-    <li><code>GET /docs</code> – API documentation (Gradio)</li>
-  </ul>
+  <div class="demo-placeholder">
+    <h3>📱 App Demo Video</h3>
+    <p>Demo video will be embedded here<br>
+    <small>Showing the iPhone app generating music in real-time</small></p>
+  </div>
 
-  <h2>WebSocket Quick Start (rt mode)</h2>
-  <p>Connect to <code>wss://&lt;your-space&gt;/ws/jam</code> and send:</p>
-  <pre>{
+  <div class="section">
+    <h2>Overview</h2>
+    <p>This API powers AI music generation using Google's MagentaRT, designed for real-time audio streaming and custom model fine-tuning. Built for iOS app integration with WebSocket streaming support.</p>
+    
+    <div class="info">
+      <strong>Hardware Requirements:</strong> Optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB works but may not maintain real-time performance.
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Quick Start - WebSocket Streaming</h2>
+    <p>Connect to <code>wss://&lt;your-space&gt;/ws/jam</code> for real-time audio generation:</p>
+
+    <h3>Start Real-time Generation</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
   "type": "start",
   "mode": "rt",
   "binary_audio": false,
   "params": {
-    "styles": "warmup",
+    "styles": "electronic, ambient",
+    "style_weights": "1.0, 0.8",
     "temperature": 1.1,
     "topk": 40,
     "guidance_weight": 1.1,
-    "pace": "realtime",          // or "asap" to bootstrap quickly
-    "max_decode_frames": 50      // default ~2.0s; try 36–45 on smaller GPUs
+    "pace": "realtime",
+    "style_ramp_seconds": 8.0,
+    "mean": 0.0,
+    "centroid_weights": "0.0, 0.0, 0.0"
   }
 }</pre>
-  <p>Update parameters live:</p>
-  <pre>{
+
+    <h3>Update Parameters Live</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
   "type": "update",
   "styles": "jazz, hiphop",
-  "style_weights": "1.0,0.8",
+  "style_weights": "1.0, 0.8",
   "temperature": 1.2,
   "topk": 64,
   "guidance_weight": 1.0,
-  "pace": "realtime",
-  "max_decode_frames": 40
+  "mean": 0.2,
+  "centroid_weights": "0.1, 0.3, 0.0"
 }</pre>
-  <p>Stop:</p>
-  <pre>{"type":"stop"}</pre>
 
-  <h2>Notes</h2>
-  <ul>
-    <li>Audio: 48 kHz stereo, ~2.0 s chunks by default with ~40 ms crossfade.</li>
-    <li>L40S 48GB: faster than realtime → prefer <code>pace: "realtime"</code>.</li>
-    <li>L4 24GB: slightly under realtime even with pre-roll and tuning.</li>
-    <li>For sustained realtime, target ~40 GB VRAM per active stream (e.g., A100 40GB or ≈35–40 GB MIG slice).</li>
-  </ul>
+    <h3>Stop Generation</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{"type": "stop"}</pre>
+  </div>
 
-  <p class="muted"><strong>Licensing:</strong> Uses MagentaRT (Apache 2.0 + CC-BY 4.0). Users are responsible for outputs.</p>
-  <p>See <a href="../blob/main/docs" target="_blank">documentation files</a> for detailed guides.</p>
-  <p>Or <a href="/docs">/docs</a> for auto-generated FastAPI reference.</p>
+  <div class="section">
+    <h2>API Endpoints</h2>
+    
+    <div class="endpoint">
+      <strong>POST /generate</strong> - Generate 4–8 bars of music with input audio
+    </div>
+    
+    <div class="endpoint">
+      <strong>POST /generate_style</strong> - Generate music from style prompts only (experimental)
+    </div>
+    
+    <div class="endpoint">
+      <strong>POST /jam/start</strong> - Start continuous jamming session
+    </div>
+    
+    <div class="endpoint">
+      <strong>GET /jam/next</strong> - Get next audio chunk from session
+    </div>
+    
+    <div class="endpoint">
+      <strong>POST /jam/consume</strong> - Mark chunk as consumed
+    </div>
+    
+    <div class="endpoint">
+      <strong>POST /jam/stop</strong> - End jamming session
+    </div>
+    
+    <div class="endpoint">
+      <strong>WEBSOCKET /ws/jam</strong> - Real-time streaming interface
+    </div>
+    
+    <div class="endpoint">
+      <strong>POST /model/select</strong> - Switch between base and fine-tuned models
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Custom Fine-Tuning</h2>
+    <p>Train your own MagentaRT models and use them with this API and the iOS app.</p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>1. Train Your Model</h3>
+        <p>Use the official MagentaRT fine-tuning notebook:</p>
+        <p><a href="https://github.com/magenta-realtime/notebooks/blob/main/Magenta_RT_Finetune.ipynb" target="_blank">🔗 MagentaRT Fine-tuning Colab</a></p>
+        <p>This will create checkpoint folders like:</p>
+        <ul>
+          <li><code>checkpoint_1861001/</code></li>
+          <li><code>checkpoint_1862001/</code></li>
+          <li>And steering assets: <code>cluster_centroids.npy</code>, <code>mean_style_embed.npy</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>2. Package Checkpoints</h3>
+        <p>Checkpoints must be compressed as .tgz files to preserve .zarray files correctly.</p>
+        <div class="warning">
+          <strong>Important:</strong> Do not download checkpoint folders directly from Google Drive - the .zarray files won't transfer properly.
+        </div>
+      </div>
+    </div>
+
+    <h3>Checkpoint Packaging Script</h3>
+    <p>Use this in a Colab cell to properly package your checkpoints:</p>
+    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button># Mount Drive to access your trained checkpoints
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Set the path to your checkpoint folder
+CKPT_SRC = '/content/drive/MyDrive/thepatch/checkpoint_1862001'  # Adjust path
+
+# Copy folder to local storage (preserves dotfiles)
+!rm -rf /content/checkpoint_1862001
+!cp -a "$CKPT_SRC" /content/
+
+# Verify .zarray files are present
+!find /content/checkpoint_1862001 -name .zarray | wc -l
+
+# Create properly formatted .tgz archive
+!tar -C /content -czf /content/checkpoint_1862001.tgz checkpoint_1862001
+
+# Verify critical files are in the archive
+!tar -tzf /content/checkpoint_1862001.tgz | grep -c '.zarray'
+
+# Download the .tgz file
+from google.colab import files
+files.download('/content/checkpoint_1862001.tgz')</pre>
+
+    <h3>3. Upload to Hugging Face</h3>
+    <p>Create a model repository and upload:</p>
+    <ul>
+      <li>Your <code>.tgz</code> checkpoint files</li>
+      <li><code>cluster_centroids.npy</code> (for steering)</li>
+      <li><code>mean_style_embed.npy</code> (for steering)</li>
+    </ul>
+    
+    <div class="info">
+      <strong>Example Repository:</strong> <a href="https://huggingface.co/thepatch/magenta-ft" target="_blank">thepatch/magenta-ft</a><br>
+      Shows the correct file structure with .tgz files and .npy steering assets in the root directory.
+    </div>
+
+    <h3>4. Use in the App</h3>
+    <p>In the iOS app's model selector, point to your Hugging Face repository URL. The app will automatically discover available checkpoints and allow switching between them.</p>
+  </div>
+
+  <div class="section">
+    <h2>Technical Specifications</h2>
+    <ul>
+      <li><strong>Audio Format:</strong> 48 kHz stereo, ~2.0s chunks with ~40ms crossfade</li>
+      <li><strong>Model Sizes:</strong> Base and Large variants available</li>
+      <li><strong>Steering:</strong> Support for text prompts, audio embeddings, and centroid-based fine-tune steering</li>
+      <li><strong>Real-time Performance:</strong> L40S recommended; L4 may experience slight delays</li>
+      <li><strong>Memory Requirements:</strong> ~40GB VRAM for sustained real-time streaming</li>
+    </ul>
+
+    <div class="warning">
+      <strong>Note:</strong> The <code>/generate_style</code> endpoint is experimental and may not properly adhere to BPM without additional context (considering metronome-based context instead of silence).
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Integration with iOS App</h2>
+    <p>This API is designed to work seamlessly with our iOS music generation app:</p>
+    <ul>
+      <li>Real-time audio streaming via WebSockets</li>
+      <li>Dynamic model switching between base and fine-tuned models</li>
+      <li>Integration with stable-audio-open-small for combined input audio generation</li>
+      <li>Live parameter adjustment during generation</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>Deployment</h2>
+    <p>To run your own instance:</p>
+    <ol>
+      <li>Duplicate this Hugging Face Space</li>
+      <li>Ensure you have access to an L40S GPU</li>
+      <li>Point your iOS app to the new space URL (e.g., <code>https://your-username-magenta-retry.hf.space</code>)</li>
+      <li>Upload your fine-tuned models as described above</li>
+    </ol>
+  </div>
+
+  <div class="section">
+    <h2>Support & Contact</h2>
+    <p>This is an active research project. For questions, technical support, or collaboration:</p>
+    <p><strong>Email:</strong> <a href="mailto:kev@thecollabagepatch.com">kev@thecollabagepatch.com</a></p>
+    
+    <div class="info">
+      <strong>Research Status:</strong> This project is under active development. Features and API may change. We welcome feedback and contributions from the research community.
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Licensing</h2>
+    <p>Built on Google's MagentaRT (Apache 2.0 + CC-BY 4.0). Users are responsible for their generated outputs and ensuring compliance with applicable laws and platform policies.</p>
+    <p><a href="/docs">📖 API Reference Documentation</a></p>
+  </div>
+
+  <script>
+    function copyCode(button) {
+      const pre = button.parentElement;
+      const code = pre.textContent.replace('Copy', '').trim();
+      navigator.clipboard.writeText(code).then(() => {
+        button.textContent = 'Copied!';
+        setTimeout(() => button.textContent = 'Copy', 2000);
+      });
+    }
+  </script>
 </body>
 </html>
