@@ -1,13 +1,21 @@
 import os
-# Useful XLA GPU optimizations (harmless if a flag is unknown)
-os.environ.setdefault(
-    "XLA_FLAGS",
-    " ".join([
-        "--xla_gpu_enable_triton_gemm=true",
-        "--xla_gpu_enable_latency_hiding_scheduler=true",
-        "--xla_gpu_autotune_level=2",
-    ])
-)
+
+# ---- Space mode gating (place above any JAX import!) ----
+SPACE_MODE = os.getenv("SPACE_MODE", "serve")  # "serve" | "template"
+
+if SPACE_MODE != "serve":
+    # In template mode, force JAX to CPU so it won't try to load CUDA plugins
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+else:
+    # Only set GPU-friendly XLA flags when we actually intend to serve on GPU
+    os.environ.setdefault(
+        "XLA_FLAGS",
+        " ".join([
+            "--xla_gpu_enable_triton_gemm=true",
+            "--xla_gpu_enable_latency_hiding_scheduler=true",
+            "--xla_gpu_autotune_level=2",
+        ])
+    )
 
 # Optional: persist JAX compile cache across restarts (reduces warmup time)
 os.environ.setdefault("JAX_CACHE_DIR", "/home/appuser/.cache/jax")
@@ -32,7 +40,7 @@ except Exception:
 
 from magenta_rt import system, audio as au
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query, JSONResponse
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
@@ -75,6 +83,35 @@ from huggingface_hub import snapshot_download, HfApi
 from pydantic import BaseModel
 
 from model_management import CheckpointManager, AssetManager, ModelSelector, ModelSelect
+
+def _gpu_probe() -> dict:
+    """
+    Returns:
+      {
+        "ok": bool,
+        "backend": str | None,        # "gpu" | "cpu" | "tpu" | None
+        "has_gpu": bool,
+        "devices": list[str],         # e.g. ["gpu:0", "gpu:1"]
+        "error": str | None,
+      }
+    """
+    try:
+        import jax
+        try:
+            backend = jax.default_backend()  # "gpu", "cpu", "tpu"
+        except Exception:
+            from jax.lib import xla_bridge
+            backend = getattr(xla_bridge.get_backend(), "platform", None)
+
+        try:
+            devices = jax.devices()
+            has_gpu = any(getattr(d, "platform", "") in ("gpu", "cuda", "rocm") for d in devices)
+            dev_list = [f"{getattr(d, 'platform', '?')}:{getattr(d, 'id', '?')}" for d in devices]
+            return {"ok": True, "backend": backend, "has_gpu": has_gpu, "devices": dev_list, "error": None}
+        except Exception as e:
+            return {"ok": False, "backend": backend, "has_gpu": False, "devices": [], "error": f"jax.devices failed: {e}"}
+    except Exception as e:
+        return {"ok": False, "backend": None, "has_gpu": False, "devices": [], "error": f"jax import failed: {e}"}
 
 # ---- Finetune assets (mean & centroids) --------------------------------------
 # _FINETUNE_REPO_DEFAULT = os.getenv("MRT_ASSETS_REPO", "thepatch/magenta-ft")
@@ -1108,7 +1145,44 @@ def jam_status(session_id: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # 1) Template mode → not ready (encourage duplication on GPU)
+    if SPACE_MODE != "serve":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "status": "template_mode",
+                "message": "This Space is a GPU template. Duplicate it and select an L40s/A100-class runtime to use the API.",
+                "mode": SPACE_MODE,
+            },
+        )
+
+    # 2) Runtime hardware probe
+    probe = _gpu_probe()
+    if not probe["ok"] or not probe["has_gpu"] or probe.get("backend") != "gpu":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "status": "gpu_unavailable",
+                "message": "GPU is not visible to JAX. Select a GPU runtime (e.g., L40s) to serve.",
+                "probe": probe,
+                "mode": SPACE_MODE,
+            },
+        )
+
+    # 3) Ready; include operational hints
+    warmed = bool(_WARMED)
+    with jam_lock:
+        active_jams = sum(1 for w in jam_registry.values() if w.is_alive())
+    return {
+        "ok": True,
+        "status": "ready" if warmed else "initializing",
+        "mode": SPACE_MODE,
+        "warmed": warmed,
+        "active_jams": active_jams,
+        "probe": probe,
+    }
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
