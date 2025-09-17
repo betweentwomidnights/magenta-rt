@@ -100,22 +100,94 @@
 <body>
   <div class="header">
     <h1>🎵 MagentaRT Research API</h1>
-    <p class="muted"><strong>AI Music Generation API</strong> • Real-time streaming • Custom fine-tuning support</p>
+    <p class="muted"><strong>AI Music Generation API</strong> • Real-time streaming • Custom fine-tune support</p>
     <span class="badge">Research Project</span>
   </div>
 
-  <div class="demo-placeholder">
-    <h3>📱 App Demo Video</h3>
-    <p>Demo video will be embedded here<br>
-    <small>Showing the iPhone app generating music in real-time</small></p>
+  <section id="env-vars" style="margin-top: 24px;">
+  <h3>⚙️ Environment variables (optional, but helpful)</h3>
+  <p>
+    You can boot this Space directly into your own finetune by setting the variables below in
+    <em>Settings → Variables and secrets → Variables</em>. If you don't set them, you can still
+    select models at runtime using <code>/model/select</code> from the frontend/API.
+  </p>
+
+  <div class="callout" style="padding:12px;border:1px solid #e0e0e0;border-radius:8px;background:#fafafa;margin:16px 0;">
+    <strong>Quick start:</strong> set these to make a finetune the default on boot:
+    <ul style="margin:8px 0 0 18px;">
+      <li><code>MRT_CKPT_REPO</code> → <code>thepatch/magenta-ft</code></li>
+      <li><code>MRT_CKPT_STEP</code> → <code>1863001</code></li>
+      <li><code>MRT_SIZE</code> → <code>large</code></li>
+    </ul>
+    <p style="margin:8px 0 0 0;"><small>Those values correspond to the example finetune in this repo (checkpoint_1863001.tgz on top of the <em>large</em> base).</small></p>
   </div>
+
+  <table class="var-table" style="width:100%;border-collapse:collapse;margin:12px 0;">
+    <thead>
+      <tr>
+        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Name</th>
+        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">What it does</th>
+        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Example</th>
+        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">When to set</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_CKPT_REPO</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Hugging Face repo ID that hosts your finetune checkpoints/assets.</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>thepatch/magenta-ft</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Set to make this finetune the default on boot.</td>
+      </tr>
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_CKPT_STEP</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Checkpoint step number to load on boot.</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>1863001</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Set if you want a specific checkpoint preselected.</td>
+      </tr>
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_SIZE</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Base model family used by the finetune (e.g., <em>large</em>).</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>large</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Set to match the base you finetuned from.</td>
+      </tr>
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>SPACE_MODE</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Controls readiness behavior: <code>serve</code> (GPU, ready to generate) vs <code>template</code> (CPU template for duplication). If unset, the server auto-detects.</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;"><code>serve</code> or <code>template</code></td>
+        <td style="padding:8px;border-bottom:1px solid #eee;">Set for explicit behavior; otherwise it falls back to auto-detection.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details style="margin-top:12px;">
+    <summary><strong>Alternative: select a model at runtime via API</strong></summary>
+    <pre style="background:#111;color:#eee;padding:12px;border-radius:8px;overflow:auto;margin-top:8px;"><code style="background: transparent; color: inherit; padding: 0; border: 0; box-shadow: none; display: block;">curl -X POST https://&lt;your-space&gt;.hf.space/model/select \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ckpt_repo": "thepatch/magenta-ft",
+    "ckpt_step": 1863001,
+    "size": "large",
+    "prewarm": true
+  }'</code></pre>
+    <p style="margin:8px 0 0 0;"><small>When you call <code>prewarm:true</code>, the backend performs a bar-aligned warmup before returning, so the first jam starts hot.</small></p>
+  </details>
+</section>
+
+  <div class="demo-placeholder">
+  <h3>📱 App Demo Video</h3>
+  <video controls preload="metadata" playsinline style="width:100%; border-radius:8px;">
+    <source src="./lil_demo_540p.mp4" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+  <p class="muted"><small>iPhone app generating music in real-time</small></p>
+</div>
 
   <div class="section">
     <h2>Overview</h2>
-    <p>This API powers AI music generation using Google's MagentaRT, designed for real-time audio streaming and custom model fine-tuning. Built for iOS app integration with WebSocket streaming support.</p>
+    <p>This API powers AI music generation using Google's MagentaRT, designed for real-time audio streaming using finetunes hosted on HF. Built for iOS app integration with WebSocket streaming support.</p>
     
     <div class="info">
-      <strong>Hardware Requirements:</strong> Optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB works but may not maintain real-time performance.
+      <strong>Hardware Requirements:</strong> Optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB almost works but will not achieve real-time performance (if someone knows an optimization that will solve this, please let me know).
     </div>
   </div>
 
