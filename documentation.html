@@ -106,7 +106,7 @@
 
   <div class="section">
     <h2>what this is</h2>
-    <p>this API serves google's <a href="https://huggingface.co/google/magenta-realtime" target="_blank">magentaRT</a> in two distinct ways. first, as a backend for our iOS app (the untitled jamming app) where users create initial loops with stability ai's <a href="https://huggingface.co/stabilityai/stable-audio-open-small" target="_blank">stable-audio-open-small</a> and then MagentaRT jams on top of that audio context. Second, as a standalone web interface that connects directly to MagentaRT via WebSockets without any audio context.</p>
+    <p>this API serves google's <a href="https://huggingface.co/google/magenta-realtime" target="_blank">magentaRT</a> in two distinct ways. first, as a backend for our iOS app (the untitled jamming app) where users create initial loops with stability ai's <a href="https://huggingface.co/stabilityai/stable-audio-open-small" target="_blank">stable-audio-open-small</a> and then MagentaRT uses the combined audio as context. second, as a standalone web interface that connects directly to magentaRT via websockets without any audio context.</p>
     
     <p>both modes support switching between base models and custom fine-tunes hosted on Hugging Face. this is designed as a template space for duplication, letting you experiment with real-time music generation outside of google colab.</p>
     
