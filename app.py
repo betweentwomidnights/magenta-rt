@@ -1,4 +1,4 @@
-import logging, os
+import os
 
 # ---- Space mode gating (place above any JAX import!) ----
 SPACE_MODE = os.getenv("SPACE_MODE")
@@ -28,33 +28,21 @@ else:
 # Optional: persist JAX compile cache across restarts (reduces warmup time)
 os.environ.setdefault("JAX_CACHE_DIR", "/home/appuser/.cache/jax")
 
-# --- JAX persistent compilation cache (new + old APIs), plus extra XLA caches ---
-
-
-CACHE_DIR = os.environ.get("JAX_CACHE_DIR", "/home/appuser/.cache/jax")
-
-# Prefer new API (JAX ≥ 0.4.26 / 0.5+), fall back to older initialize_cache
+import jax
+# ✅ Valid choices include: "default", "high", "highest", "tensorfloat32", "float32", etc.
+# TF32 is the sweet spot on Ampere/Ada GPUs for ~1.1–1.3× matmul speedups.
 try:
-    from jax.experimental import compilation_cache as cc  # new-style
-    if hasattr(cc, "set_cache_dir"):
-        cc.set_cache_dir(CACHE_DIR)
-        logging.info("JAX persistent cache (set_cache_dir) -> %s", CACHE_DIR)
-    else:
-        raise ImportError
+    jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 except Exception:
-    try:
-        from jax.experimental.compilation_cache import compilation_cache as cc_old  # old-style
-        cc_old.initialize_cache(CACHE_DIR)
-        logging.info("JAX persistent cache (initialize_cache) -> %s", CACHE_DIR)
-    except Exception as e:
-        logging.warning("JAX persistent cache init skipped: %s", e)
+    jax.config.update("jax_default_matmul_precision", "high")  # older alias
 
-# Extra XLA caches piggyback on the persistent cache (best effort)
+# Initialize the on-disk compilation cache (best-effort)
 try:
-    import jax
-    jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-except Exception as e:
-    logging.info("XLA extra caches not enabled: %s", e)
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache(os.environ["JAX_CACHE_DIR"])
+except Exception:
+    pass
+# --------------------------------------------------------------------
 
 
 
@@ -78,6 +66,8 @@ from jam_worker import JamWorker, JamParams, JamChunk
 from one_shot_generation import generate_loop_continuation_with_mrt, generate_style_only_with_mrt
 
 import uuid, threading
+
+import logging
 
 import gradio as gr
 from typing import Optional, Union, Literal
@@ -367,21 +357,15 @@ _WARMUP_LOCK = threading.Lock()
 
 def _mrt_warmup():
     """
-    Build a minimal, bar-aligned silent context and run a couple of ~2s generate_chunk
-    passes to trigger JIT, fill persistent caches, and run XLA autotune.
+    Build a minimal, bar-aligned silent context and run one 2s generate_chunk
+    to trigger XLA JIT & autotune so first real request is fast.
     """
     global _WARMED
     with _WARMUP_LOCK:
         if _WARMED:
             return
         try:
-            # Touch JAX backend early (brings up CUDA context etc.)
-            try:
-                import jax; _ = jax.devices()
-            except Exception:
-                pass
-
-            mrt = get_mrt()  # will build model and (with our earlier changes) ensure assets if envs are set
+            mrt = get_mrt()
 
             # --- derive timing from model config ---
             codec_fps = float(mrt.codec.frame_rate)
@@ -422,18 +406,10 @@ def _mrt_warmup():
                 state.context_tokens = context_tokens
                 style_vec = mrt.embed_style("warmup")
 
-                # --- prime compiled paths & autotune: run twice ---
-                wav1, state = mrt.generate_chunk(state=state, style=style_vec)  # compile + autotune
-                wav2, _     = mrt.generate_chunk(state=state, style=style_vec)  # hit cached executables
+                # --- one throwaway chunk (~2s) ---
+                _wav, _state = mrt.generate_chunk(state=state, style=style_vec)
 
-                # Optional sanity: ensure we didn't return all zeros
-                try:
-                    if np.abs(wav2.samples).mean() <= 1e-7:
-                        logging.warning("Warmup produced near-silence; continuing.")
-                except Exception:
-                    pass
-
-                logging.info("MagentaRT warmup complete (persistent cache primed).")
+                logging.info("MagentaRT warmup complete.")
             finally:
                 try:
                     os.unlink(tmp_path)
