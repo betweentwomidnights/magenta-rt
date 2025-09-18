@@ -99,8 +99,8 @@
 </head>
 <body>
   <div class="header">
-    <h1>MagentaRT Research API</h1>
-    <p class="muted"><strong>AI Music Generation API</strong> • real-time streaming with http/ws • custom fine-tune model-switching support</p>
+    <h1>magentaRT research API</h1>
+    <p class="muted"><strong>exploring ways to jam</strong> • real-time streaming with http/ws • custom fine-tune model-switching support</p>
     <span class="badge">research project</span>
   </div>
 
@@ -205,12 +205,12 @@
 
   <div class="section">
     <h2>overview</h2>
-    <p>this API revolves around google's magentaRT, designed for real-time audio streaming using finetunes hosted on HF. built for iOS app integration with webSocket streaming support for web applications (and potentially VSTs inside the DAW).</p>
+    <p>this API revolves around google's magentaRT, designed for real-time audio streaming using finetunes hosted on HF. built for iOS app integration with webSocket streaming support for web applications (and potentially VST plugins).</p>
   </div>
 
   <div class="section">
-    <h2>quick start - WebSocket streaming</h2>
-    <p>Connect to <code>wss://&lt;your-space&gt;/ws/jam</code> for real-time audio generation:</p>
+    <h2>quick start - webSocket streaming</h2>
+    <p>connect to <code>wss://&lt;your-space&gt;/ws/jam</code> for real-time audio generation:</p>
 
     <h3>start real-time generation</h3>
     <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
@@ -284,14 +284,14 @@
 
   <div class="section">
     <h2>custom fine-tuning</h2>
-    <p>train your own MagentaRT models and use them in the web app demo and the iOS app.</p>
+    <p>train your own MagentaRT models and use them in the web app demo or the iOS app.</p>
 
     <div class="grid">
       <div class="card">
         <h3>1. train your model</h3>
         <p>use the official MagentaRT fine-tuning notebook:</p>
         <p><a href="https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Finetune.ipynb" target="_blank">MagentaRT Fine-tuning Colab</a></p>
-        <p>This will create checkpoint folders like:</p>
+        <p>this will create checkpoint folders like:</p>
         <ul>
           <li><code>checkpoint_1861001/</code></li>
           <li><code>checkpoint_1862001/</code></li>
@@ -343,7 +343,7 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
     </ul>
     
     <div class="info">
-      <strong>Example Repository:</strong> <a href="https://huggingface.co/thepatch/magenta-ft" target="_blank">thepatch/magenta-ft</a><br>
+      <strong>example repository:</strong> <a href="https://huggingface.co/thepatch/magenta-ft" target="_blank">thepatch/magenta-ft</a><br>
       shows the correct file structure with .tgz files and .npy steering assets in the root directory.
     </div>
 
@@ -375,13 +375,13 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
   </div>
 
       <div class="warning">
-      <strong>Note:</strong> The <code>/generate_style</code> endpoint is experimental and may not properly adhere to BPM without additional context (considering metronome-based context instead of silence).
+      <strong>note:</strong> the <code>/generate_style</code> endpoint is experimental and may not properly adhere to BPM without additional context (considering metronome-based context instead of silence).
     </div>
   </div>
 
   <div class="section">
     <h2>deployment</h2>
-    <p>To run your own instance:</p>
+    <p>to run your own instance:</p>
     <ol>
       <li>duplicate this huggingface space by clicking the three dots in the top right</li>
       <li>select 'run locally' if you got a 5090 or something</li>
