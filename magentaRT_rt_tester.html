@@ -258,9 +258,9 @@ function beginPlaybackFromPending() {
     scheduleAudioBuffer(abuf);
   }
   // Flip server pacing to realtime after we’ve started, if bootstrapping was enabled
-  if ($("chkBootstrap").checked) {
-    try { ws?.send(JSON.stringify({ type: "update", pace: "realtime" })); } catch {}
-  }
+  // if ($("chkBootstrap").checked) {
+  //   try { ws?.send(JSON.stringify({ type: "update", pace: "realtime" })); } catch {}
+  // }
 }
 
   // Audio chain
@@ -315,7 +315,7 @@ async function scheduleWavBytes(arrayBuffer) {
     const abuf = await ctx.decodeAudioData(arrayBuffer);
     if (!abuf) return;
 
-    const need = parseInt($("numPreroll").value || "0", 10);
+    const need = 0; // this used to be for pre-roll. it didn't help with realtime on the L4.
     if (!playing) {
       pending.push(abuf);
       queueEl.textContent = `${pending.length} pending, 0.00s scheduled`;
@@ -624,6 +624,11 @@ async function scheduleWavBytes(arrayBuffer) {
   // Run once on load
   checkHealthAndGate();
   refreshFinetuneControls();
+
+  document.addEventListener("DOMContentLoaded", () => {
+  checkHealthAndGate?.();       // if you added /health gating
+  refreshFinetuneControls?.();  // pulls /model/config and toggles the finetune card
+});
 
 })();
 </script>
