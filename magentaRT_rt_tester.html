@@ -31,6 +31,15 @@
     .err { color: #ff8080; }
     .badge { padding: 2px 6px; border-radius: 999px; background: #2a2a3a; font-size: 12px; }
     .sep { height: 1px; background: #212133; margin: 12px 0; }
+
+    .style-list { display: flex; flex-direction: column; gap: 8px; }
+    .style-row {
+      display: grid;
+      grid-template-columns: 1fr 140px 70px 32px; /* name | slider | number | X */
+      gap: 10px;
+      align-items: center;
+    }
+    .style-row .remove { padding: 6px 8px; line-height: 1; }
   </style>
 </head>
 <body>
@@ -110,11 +119,16 @@
         <button id="btnUpdate" class="btn">Send Update Now</button>
       </div>
       <div class="col-6">
-        <label>Styles (comma-separated or prompt text)</label>
-        <textarea id="txtStyles" placeholder="e.g., acid house, techno">warmup</textarea>
-        <label>Style weights (comma-separated, optional)</label>
-        <input id="txtStyleWeights" type="text" placeholder="e.g., 1.0, 0.5" />
-        <label class="small"><input id="chkUseMixStyle" type="checkbox" /> Use current mix as style</label>
+        <label>Styles</label>
+        <div id="stylesUI">
+          <div id="styleRows" class="style-list"></div>
+          <div class="controls">
+            <button id="btnAddStyle" class="btn" type="button">+ Add style</button>
+            <label class="small" style="margin-left:8px;">
+              <input id="chkUseMixStyle" type="checkbox" /> Use current mix as style
+            </label>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -202,8 +216,8 @@
   const rngGuid = $("rngGuid"), numGuid = $("numGuid");
   const rngTopk = $("rngTopk"), numTopk = $("numTopk");
   const rngVol = $("rngVol"), numVol = $("numVol");
-  const txtStyles = $("txtStyles");
-  const txtStyleWeights = $("txtStyleWeights");
+  // const txtStyles = $("txtStyles");
+  // const txtStyleWeights = $("txtStyleWeights");
   const chkUseMixStyle = $("chkUseMixStyle");
   const statusEl = $("status");
   const queueEl = $("queue");
@@ -331,20 +345,20 @@ async function scheduleWavBytes(arrayBuffer) {
   }
 }
 
-  function currentParams() {
-    return {
-      temperature: parseFloat(numTemp.value),
-      topk: parseInt(numTopk.value, 10),
-      guidance_weight: parseFloat(numGuid.value),
-      styles: txtStyles.value,
-      style_weights: txtStyleWeights.value,
-      use_current_mix_as_style: !!chkUseMixStyle.checked,
+  // function currentParams() {
+  //   return {
+  //     temperature: parseFloat(numTemp.value),
+  //     topk: parseInt(numTopk.value, 10),
+  //     guidance_weight: parseFloat(numGuid.value),
+  //     styles: txtStyles.value,
+  //     style_weights: txtStyleWeights.value,
+  //     use_current_mix_as_style: !!chkUseMixStyle.checked,
 
-      // NEW:
-      mean: parseFloat(numMean.value),
-      centroid_weights: centroidWeightsCSV(),
-    };
-  }
+  //     // NEW:
+  //     mean: parseFloat(numMean.value),
+  //     centroid_weights: centroidWeightsCSV(),
+  //   };
+  // }
 
   function sendUpdate() {
     if (!ws || ws.readyState !== 1) return;
@@ -393,6 +407,92 @@ async function scheduleWavBytes(arrayBuffer) {
   linkRangeNumber(rngC3, numC3);
   linkRangeNumber(rngC4, numC4);
   linkRangeNumber(rngC5, numC5);
+
+  
+  // --- Dynamic Styles UI ---
+  const styleRows = document.getElementById("styleRows");
+  const btnAddStyle = document.getElementById("btnAddStyle");
+
+  function addStyleRow(name = "", weight = 1.0) {
+    const row = document.createElement("div");
+    row.className = "style-row";
+    row.innerHTML = `
+      <input class="style-name" type="text" placeholder="e.g. acid house" value="${name}">
+      <input class="style-range" type="range" min="0.0" max="2.0" step="0.01" value="${weight}">
+      <input class="style-number" type="number" min="0.0" max="2.0" step="0.01" value="${weight}">
+      <button class="btn remove" type="button" title="Remove">×</button>
+    `;
+
+    const nameEl = row.querySelector(".style-name");
+    const rangeEl = row.querySelector(".style-range");
+    const numEl   = row.querySelector(".style-number");
+    const remove  = row.querySelector(".remove");
+
+    // keep slider/number in sync + auto-update
+    const sync = (fromRange) => {
+      if (fromRange) numEl.value = rangeEl.value;
+      else rangeEl.value = numEl.value;
+    };
+    rangeEl.addEventListener("input", () => { sync(true); debouncedUpdate(); });
+    numEl.addEventListener("input",   () => { sync(false); debouncedUpdate(); });
+    nameEl.addEventListener("input",  () => { debouncedUpdate(); });
+
+    remove.addEventListener("click", () => { row.remove(); debouncedUpdate(); });
+
+    styleRows.appendChild(row);
+    // initial sync
+    sync(true);
+  }
+
+  function stylesCSV() {
+    // only include rows with non-empty names
+    return [...styleRows.querySelectorAll(".style-row")]
+      .map(r => r.querySelector(".style-name").value.trim())
+      .filter(s => s.length > 0)
+      .join(", ");
+  }
+
+  function styleWeightsCSV() {
+    // weights aligned with non-empty names (server defaults to 1.0 if missing)
+    const out = [];
+    for (const r of styleRows.querySelectorAll(".style-row")) {
+      const name = r.querySelector(".style-name").value.trim();
+      if (!name) continue;
+      const val = parseFloat(r.querySelector(".style-number").value);
+      out.push(Number.isFinite(val) ? val : 1.0);
+    }
+    return out.join(",");
+  }
+
+  // Default row to match your previous "warmup" default
+  addStyleRow("warmup", 1.0);
+
+  // add style on click
+  btnAddStyle.addEventListener("click", () => addStyleRow("", 1.0));
+
+  // --- Wire into your existing param-building ---
+  // Replace txtStyles/txtStyleWeights usage inside currentParams()
+  const ORIGINAL_currentParams = currentParams; // keep a copy if needed
+  currentParams = function () {
+  return {
+    temperature: parseFloat(numTemp.value),
+    topk: parseInt(numTopk.value, 10),
+    guidance_weight: parsefloatSafe(numGuid.value, 1.1),
+
+    // from the dynamic rows:
+    styles: stylesCSV(),
+    style_weights: styleWeightsCSV(),
+    use_current_mix_as_style: !!chkUseMixStyle.checked,
+
+    mean: parsefloatSafe(numMean?.value, 1.0),
+    centroid_weights: centroidWeightsCSV(),
+  };
+};
+
+  function parsefloatSafe(v, dflt) {
+    const x = parseFloat(v);
+    return Number.isFinite(x) ? x : dflt;
+  }
 
   async function start() {
     if (connected) return;
