@@ -581,9 +581,15 @@ def model_select(req: ModelSelect):
     if req.dry_run:
         return {"ok": True, "dry_run": True, **validation_result}
     
-    if req.ckpt_step == "none":  # user asked for stock base
-        asset_manager.clear_assets()       # implement .clear_assets() to set embeds/centroids to None
-        _sync_assets_globals_from_manager()
+    if isinstance(req.step, str) and req.step.lower() == "none":  # user asked for stock base
+        # Clear any resident finetune assets so /model/config reflects "no assets"
+        asset_manager.mean_embed = None
+        asset_manager.centroids = None
+        asset_manager.assets_repo_id = None
+        # keep module-level mirrors in sync
+        _MEAN_EMBED = None
+        _CENTROIDS = None
+        _ASSETS_REPO_ID = None
 
     # 2) Handle jam policy
     if _any_jam_running():
