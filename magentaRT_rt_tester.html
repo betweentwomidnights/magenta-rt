@@ -589,7 +589,8 @@ async function scheduleWavBytes(arrayBuffer) {
       const payload = {
         size: (selSize?.value || undefined),
         prewarm: !!(selPrewarm && selPrewarm.checked),
-        stop_active: !!(selStopActive && selStopActive.checked)
+        stop_active: !!(selStopActive && selStopActive.checked),
+        sync_assets: true,
       };
       if (useBase) {
         // Signal stock model: step="none" as per backend's selector
@@ -624,11 +625,38 @@ async function scheduleWavBytes(arrayBuffer) {
   // Run once on load
   checkHealthAndGate();
   refreshFinetuneControls();
+  refreshModelInfo();
 
-  document.addEventListener("DOMContentLoaded", () => {
-  checkHealthAndGate?.();       // if you added /health gating
-  refreshFinetuneControls?.();  // pulls /model/config and toggles the finetune card
-});
+  async function refreshModelInfo() {
+    const el = document.getElementById("modelStatus");
+    if (!el) return;
+    try {
+      const r = await fetch("/model/config", { cache: "no-store" });
+      if (!r.ok) throw new Error("status " + r.status);
+      const cfg = await r.json();
+
+      const size = cfg.size || cfg.model_size || 'unknown';
+      const repo = cfg.ckpt_repo || cfg.repo_id || cfg.repo || (cfg.ckpt && cfg.ckpt.repo) || cfg.active_repo;
+      const step = cfg.ckpt_step || cfg.step || (cfg.ckpt && cfg.ckpt.step) || cfg.active_step;
+      const isBase = (!repo) || (step === "none");
+
+      const hasMean = !!(cfg.mean_loaded || cfg.has_mean_embed || cfg.mean_style_embed || cfg.mean);
+      const hasCentroids = !!(cfg.centroids_loaded || cfg.has_centroids || cfg.cluster_centroids || cfg.centroids);
+
+      let line = '';
+      if (isBase) {
+        line = `Model: base <strong>${size}</strong>`;
+      } else {
+        line = `Model: finetune <strong>${repo}</strong>@<strong>${step}</strong> (base <strong>${size}</strong>)`;
+      }
+      line += ` &nbsp;•&nbsp; assets: ${hasMean ? "mean✓" : "mean×"}/${hasCentroids ? "centroids✓" : "centroids×"}`;
+
+      el.innerHTML = `<div style="padding:8px;border-radius:6px;background:#0f1f2a;border:1px solid #214459">${line}</div>`;
+    } catch (e) {
+      const el = document.getElementById("modelStatus");
+      if (el) el.innerHTML = '';
+    }
+  }
 
 })();
 </script>
