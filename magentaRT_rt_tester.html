@@ -345,20 +345,20 @@ async function scheduleWavBytes(arrayBuffer) {
   }
 }
 
-  // function currentParams() {
-  //   return {
-  //     temperature: parseFloat(numTemp.value),
-  //     topk: parseInt(numTopk.value, 10),
-  //     guidance_weight: parseFloat(numGuid.value),
-  //     styles: txtStyles.value,
-  //     style_weights: txtStyleWeights.value,
-  //     use_current_mix_as_style: !!chkUseMixStyle.checked,
+  function currentParams() {
+    return {
+      temperature: parseFloat(numTemp.value),
+      topk: parseInt(numTopk.value, 10),
+      guidance_weight: parseFloat(numGuid.value),
+      styles: txtStyles.value,
+      style_weights: txtStyleWeights.value,
+      use_current_mix_as_style: !!chkUseMixStyle.checked,
 
-  //     // NEW:
-  //     mean: parseFloat(numMean.value),
-  //     centroid_weights: centroidWeightsCSV(),
-  //   };
-  // }
+      // NEW:
+      mean: parseFloat(numMean.value),
+      centroid_weights: centroidWeightsCSV(),
+    };
+  }
 
   function sendUpdate() {
     if (!ws || ws.readyState !== 1) return;
