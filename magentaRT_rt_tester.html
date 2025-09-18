@@ -417,17 +417,20 @@ async function scheduleWavBytes(arrayBuffer) {
       btnStop.disabled = false;
       setStatus("connected");
 
+      const realtime = $("chkRealtime")?.checked === true;
+      const binary = $("chkBinary")?.checked === true;
+
       const msg = {
         type: "start",
         mode: "rt",
-        binary_audio: !!chkBinary.checked,
+        binary_audio: !!binary,
         params: {
           ...currentParams(),
-          pace: $("chkBootstrap").checked
-            ? "asap"       // build pre-roll as fast as possible, then we’ll flip
-            : ($("chkRealtime").checked ? "realtime" : "asap")
-        }
+          // no bootstrap or pre-roll anymore
+          pace: realtime ? "realtime" : "asap",
+        },
       };
+
       ws.send(JSON.stringify(msg));
       log("→ start " + JSON.stringify(msg), "ok");
       nextTime = ctx.currentTime + 0.12;
