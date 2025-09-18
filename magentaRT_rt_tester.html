@@ -32,14 +32,34 @@
     .badge { padding: 2px 6px; border-radius: 999px; background: #2a2a3a; font-size: 12px; }
     .sep { height: 1px; background: #212133; margin: 12px 0; }
 
-    .style-list { display: flex; flex-direction: column; gap: 8px; }
+    .row > [class^="col-"] { min-width: 0; }
+
+    @media (min-width: 901px) {
+      .row { column-gap: 24px; }         /* more breathing room between L/R halves */
+      .col-6 { min-width: 0; overflow: hidden; } /* clip any tiny visual bleed */
+    }
+
+    /* prevent tiny default margins on sliders from poking into the gutter */
+    input[type="range"] { margin: 0; }
+
+    /* belt-and-suspenders: keep style rows from visually spilling */
+    .style-row { overflow: hidden; }
+
+    .style-list { display: flex; flex-direction: column; gap: 12px; }
+    
     .style-row {
       display: grid;
-      grid-template-columns: 1fr 140px 70px 32px; /* name | slider | number | X */
+      grid-template-columns: minmax(0,1fr) 140px 70px 32px; /* name | slider | number | X */
       gap: 10px;
       align-items: center;
     }
+    .style-row .style-name,
+    .style-row .style-range { min-width: 0; }
     .style-row .remove { padding: 6px 8px; line-height: 1; }
+    @media (max-width: 900px) {
+      .row { grid-template-columns: 1fr; }
+      .col-6, .col-12, .col-4, .col-3, .col-2 { grid-column: 1 / -1; }
+    }
   </style>
 </head>
 <body>
