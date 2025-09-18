@@ -150,6 +150,8 @@ COPY --chown=appuser:appuser documentation.html /home/appuser/app/documentation.
 
 COPY --chown=appuser:appuser lil_demo_540p.mp4 /home/appuser/app/lil_demo_540p.mp4
 
+COPY --chown=appuser:appuser magentaRT_rt_tester.html /home/appuser/app/magentaRT_rt_tester.html
+
 # Create docs directory and copy documentation files
 COPY --chown=appuser:appuser docs/ /home/appuser/app/docs/
 

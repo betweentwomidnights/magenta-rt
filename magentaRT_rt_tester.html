@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MagentaRT Realtime Tester (rt-mode)</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    body { margin: 0; padding: 24px; background: #0b0b0f; color: #e6e6ea; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .card { background: #15151c; border: 1px solid #232334; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 12px; color: #b0b0bb; margin: 8px 0 6px; }
+    input[type="text"], textarea, input[type="number"] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #2a2a3a; background: #0f0f14; color: #e6e6ea; }
+    textarea { min-height: 72px; resize: vertical; }
+    .row { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; }
+    .col-6 { grid-column: span 6; }
+    .col-4 { grid-column: span 4; }
+    .col-3 { grid-column: span 3; }
+    .col-2 { grid-column: span 2; }
+    .col-12 { grid-column: span 12; }
+    .btn { appearance: none; padding: 10px 14px; border-radius: 10px; border: 1px solid #2a2a3a; background: #20202a; color: #fff; cursor: pointer; }
+    .btn:hover { background: #2a2a36; }
+    .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .small { font-size: 12px; color: #a6a6b3; }
+    .range-row { display: grid; grid-template-columns: 100px 1fr 60px; gap: 10px; align-items: center; }
+    input[type="range"] { width: 100%; }
+    .log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background: #0f0f14; border: 1px solid #2a2a3a; padding: 10px; border-radius: 8px; min-height: 160px; white-space: pre-wrap; overflow: auto; }
+    .ok { color: #9fe870; }
+    .warn { color: #ffda6b; }
+    .err { color: #ff8080; }
+    .badge { padding: 2px 6px; border-radius: 999px; background: #2a2a3a; font-size: 12px; }
+    .sep { height: 1px; background: #212133; margin: 12px 0; }
+  </style>
+</head>
+<body>
+  <h1>MagentaRT Realtime Tester <span class="badge">rt-mode</span></h1>
+
+  <div class="card">
+    <div class="row">
+      <div class="col-12"><div class="small">Model selection</div></div>
+      <div class="col-6">
+        <label>Checkpoint repo (HF)</label>
+        <input id="selRepo" type="text" placeholder="e.g., thepatch/magenta-ft" />
+      </div>
+      <div class="col-3">
+        <label>Checkpoint step</label>
+        <input id="selStep" type="number" min="0" step="1" placeholder="e.g., 1863001" />
+      </div>
+      <div class="col-3">
+        <label>Base size</label>
+        <input id="selSize" type="text" placeholder="large" value="large" />
+      </div>
+      <div class="col-12 controls">
+        <label class="small"><input id="chkBase" type="checkbox" /> Use base model (no checkpoint)</label>
+        <label class="small"><input id="selPrewarm" type="checkbox" checked /> Prewarm before returning</label>
+        <label class="small"><input id="selStopActive" type="checkbox" checked /> Stop any active jam</label>
+        <button id="btnSelectModel" class="btn">Select model & warm up</button>
+        <span id="selStatus" class="small"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="healthBanner" class="small" style="margin:8px 0 12px;"></div>
+
+  <div class="card">
+    <div class="row">
+      <div class="col-12">
+        <label>WebSocket URL</label>
+        <input id="wsUrl" type="text" value="wss://thecollabagepatch-magenta-retry.hf.space/ws/jam" />
+      </div>
+      <div class="col-12 controls">
+        <button id="btnStart" class="btn">Start</button>
+        <button id="btnStop" class="btn" disabled>Stop</button>
+        <button id="btnPing" class="btn">Ping</button>
+        <label class="small"><input id="chkBinary" type="checkbox" /> Receive binary WAV frames</label>
+        <label class="small"><input id="chkAutoUpdate" type="checkbox" checked /> Auto-update on slider change (150ms debounce)</label>
+        <label class="small"><input id="chkLogAudio" type="checkbox" /> Log chunk sizes</label>
+        <label class="small"><input id="chkRealtime" type="checkbox" checked /> Ask server to pace real-time</label>
+        <label class="small"><input id="chkBootstrap" type="checkbox" checked /> Bootstrap fast (ASAP → flip to realtime)</label>
+        <label class="small">Pre-roll chunks: <input id="numPreroll" type="number" min="0" max="12" step="1" value="3" style="width:60px"></label>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="col-6">
+        <div class="range-row">
+          <label>Temperature</label>
+          <input id="rngTemp" type="range" min="0.10" max="2.00" step="0.01" value="1.10" />
+          <input id="numTemp" type="number" min="0.10" max="2.00" step="0.01" value="1.10" />
+        </div>
+        <div class="range-row">
+          <label>Guidance</label>
+          <input id="rngGuid" type="range" min="0.0" max="8.0" step="0.1" value="1.10" />
+          <input id="numGuid" type="number" min="0.0" max="8.0" step="0.1" value="1.10" />
+        </div>
+        <div class="range-row">
+          <label>TopK</label>
+          <input id="rngTopk" type="range" min="1" max="256" step="1" value="40" />
+          <input id="numTopk" type="number" min="1" max="256" step="1" value="40" />
+        </div>
+        <div class="range-row">
+          <label>Volume</label>
+          <input id="rngVol" type="range" min="0" max="1" step="0.01" value="1" />
+          <input id="numVol" type="number" min="0" max="1" step="0.01" value="1" />
+        </div>
+        <div class="sep"></div>
+        <button id="btnUpdate" class="btn">Send Update Now</button>
+      </div>
+      <div class="col-6">
+        <label>Styles (comma-separated or prompt text)</label>
+        <textarea id="txtStyles" placeholder="e.g., acid house, techno">warmup</textarea>
+        <label>Style weights (comma-separated, optional)</label>
+        <input id="txtStyleWeights" type="text" placeholder="e.g., 1.0, 0.5" />
+        <label class="small"><input id="chkUseMixStyle" type="checkbox" /> Use current mix as style</label>
+      </div>
+    </div>
+  </div>
+
+    <div class="card" id="finetuneControls" style="display:none;">
+    <div class="row">
+      <div class="col-12"><div class="small">In-distribution steering</div></div>
+
+      <div class="col-6">
+        <div class="range-row">
+          <label>Mean</label>
+          <input id="rngMean" type="range" min="0.0" max="2.0" step="0.01" value="1.00" />
+          <input id="numMean" type="number" min="0.0" max="2.0" step="0.01" value="1.00" />
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="range-row">
+          <label>Centroid 1</label>
+          <input id="rngC1" type="range" min="0.0" max="2.0" step="0.01" value="0.00" />
+          <input id="numC1" type="number" min="0.0" max="2.0" step="0.01" value="0.00" />
+        </div>
+        <div class="range-row">
+          <label>Centroid 2</label>
+          <input id="rngC2" type="range" min="0.0" max="2.0" step="0.01" value="0.00" />
+          <input id="numC2" type="number" min="0.0" max="2.0" step="0.01" value="0.00" />
+        </div>
+        <div class="range-row">
+          <label>Centroid 3</label>
+          <input id="rngC3" type="range" min="0.0" max="2.0" step="0.01" value="0.00" />
+          <input id="numC3" type="number" min="0.0" max="2.0" step="0.01" value="0.00" />
+        </div>
+        <div class="range-row">
+          <label>Centroid 4</label>
+          <input id="rngC4" type="range" min="0.0" max="2.0" step="0.01" value="0.00" />
+          <input id="numC4" type="number" min="0.0" max="2.0" step="0.01" value="0.00" />
+        </div>
+        <div class="range-row">
+          <label>Centroid 5</label>
+          <input id="rngC5" type="range" min="0.0" max="2.0" step="0.01" value="0.00" />
+          <input id="numC5" type="number" min="0.0" max="2.0" step="0.01" value="0.00" />
+        </div>
+      </div>
+
+      <div class="col-6">
+        <p class="small">
+          These steer the style embedding toward your finetune distribution.
+          <br/>Mean defaults to 1.0 (on); centroids default to 0.0 (off).
+          <br/>Adjust live while jamming.
+        </p>
+      </div>
+    </div>
+  </div>
+
+
+  <div class="card">
+    <div class="row">
+      <div class="col-6">
+        <div class="small">Audio Status</div>
+        <div id="status">stopped</div>
+      </div>
+      <div class="col-6">
+        <div class="small">Queue</div>
+        <div id="queue">0 buffers, 0.00s scheduled</div>
+      </div>
+      <div class="col-12">
+        <label>Log</label>
+        <div id="log" class="log"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const wsUrl = $("wsUrl");
+  const btnStart = $("btnStart");
+  const btnStop = $("btnStop");
+  const btnPing = $("btnPing");
+  const btnUpdate = $("btnUpdate");
+  const chkBinary = $("chkBinary");
+  const chkAutoUpdate = $("chkAutoUpdate");
+  const chkLogAudio = $("chkLogAudio");
+  const rngTemp = $("rngTemp"), numTemp = $("numTemp");
+  const rngGuid = $("rngGuid"), numGuid = $("numGuid");
+  const rngTopk = $("rngTopk"), numTopk = $("numTopk");
+  const rngVol = $("rngVol"), numVol = $("numVol");
+  const txtStyles = $("txtStyles");
+  const txtStyleWeights = $("txtStyleWeights");
+  const chkUseMixStyle = $("chkUseMixStyle");
+  const statusEl = $("status");
+  const queueEl = $("queue");
+  const logEl = $("log");
+
+  const rngMean = $("rngMean"), numMean = $("numMean");
+  const rngC1 = $("rngC1"), numC1 = $("numC1");
+  const rngC2 = $("rngC2"), numC2 = $("numC2");
+  const rngC3 = $("rngC3"), numC3 = $("numC3");
+  const rngC4 = $("rngC4"), numC4 = $("numC4");
+  const rngC5 = $("rngC5"), numC5 = $("numC5");
+
+  const XFADE_MS = 25; // crossfade length
+
+  let pending = [];            // decoded AudioBuffers waiting to be scheduled
+let playing = false;         // have we started playback?
+const START_CUSHION = 0.12;  // already used
+
+const fade = XFADE_MS / 1000;
+
+function scheduleAudioBuffer(abuf) {
+  // Overlap-add crossfade scheduling (same as your scheduleWavBytes but taking a decoded buffer)
+  const src = ctx.createBufferSource();
+  const g = ctx.createGain();
+  src.buffer = abuf;
+  src.connect(g); g.connect(gain);
+
+  if (nextTime < ctx.currentTime + 0.05) nextTime = ctx.currentTime + START_CUSHION;
+  const startAt = nextTime;
+  const dur = abuf.duration;
+
+  // Overlap by 'fade' so there’s no dip
+  nextTime = startAt + Math.max(0, dur - fade);
+
+  g.gain.setValueAtTime(0.0, startAt);
+  g.gain.linearRampToValueAtTime(1.0, startAt + fade);
+  g.gain.setValueAtTime(1.0, startAt + Math.max(0, dur - fade));
+  g.gain.linearRampToValueAtTime(0.0, startAt + dur);
+
+  src.start(startAt);
+  scheduled.push({ src, when: startAt, dur });
+  updateQueueUI();
+  src.onended = () => { scheduled = scheduled.filter(s => s.src !== src); updateQueueUI(); };
+}
+
+function beginPlaybackFromPending() {
+  if (playing) return;
+  playing = true;
+  nextTime = ctx.currentTime + START_CUSHION;
+  while (pending.length) {
+    const abuf = pending.shift();
+    scheduleAudioBuffer(abuf);
+  }
+  // Flip server pacing to realtime after we’ve started, if bootstrapping was enabled
+  if ($("chkBootstrap").checked) {
+    try { ws?.send(JSON.stringify({ type: "update", pace: "realtime" })); } catch {}
+  }
+}
+
+  // Audio chain
+  let AudioCtx = window.AudioContext || window.webkitAudioContext;
+  let ctx = null;
+  let gain = null;
+  let nextTime = 0;
+  let scheduled = []; // [{src, when, dur}]
+  let ws = null;
+  let connected = false;
+  let autoUpdateTimer = null;
+
+  function log(msg, cls) {
+    const line = document.createElement("div");
+    line.textContent = msg;
+    if (cls) line.className = cls;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(txt) {
+    statusEl.textContent = txt;
+  }
+
+  function updateQueueUI() {
+    const total = scheduled.reduce((acc, s) => acc + s.dur, 0);
+    queueEl.textContent = `${scheduled.length} buffers, ${total.toFixed(2)}s scheduled`;
+  }
+
+  function clearSchedule() {
+    scheduled.forEach(s => { try { s.src.stop(); } catch(e){} });
+    scheduled = [];
+    pending = [];
+    playing = false;
+    nextTime = 0;
+    updateQueueUI();
+  }
+
+  function base64ToArrayBuffer(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const buf = new ArrayBuffer(len);
+    const view = new Uint8Array(buf);
+    for (let i = 0; i < len; i++) view[i] = bin.charCodeAt(i);
+    return buf;
+  }
+
+
+async function scheduleWavBytes(arrayBuffer) {
+  if (!ctx) return;
+  try {
+    const abuf = await ctx.decodeAudioData(arrayBuffer);
+    if (!abuf) return;
+
+    const need = parseInt($("numPreroll").value || "0", 10);
+    if (!playing) {
+      pending.push(abuf);
+      queueEl.textContent = `${pending.length} pending, 0.00s scheduled`;
+      // start once we hit the threshold
+      if (pending.length >= need) beginPlaybackFromPending();
+      return;
+    }
+
+    // already playing → schedule immediately
+    scheduleAudioBuffer(abuf);
+  } catch (e) {
+    log("decode error: " + e.message, "err");
+  }
+}
+
+  function currentParams() {
+    return {
+      temperature: parseFloat(numTemp.value),
+      topk: parseInt(numTopk.value, 10),
+      guidance_weight: parseFloat(numGuid.value),
+      styles: txtStyles.value,
+      style_weights: txtStyleWeights.value,
+      use_current_mix_as_style: !!chkUseMixStyle.checked,
+
+      // NEW:
+      mean: parseFloat(numMean.value),
+      centroid_weights: centroidWeightsCSV(),
+    };
+  }
+
+  function sendUpdate() {
+    if (!ws || ws.readyState !== 1) return;
+    const msg = { type: "update", ...currentParams() };
+    ws.send(JSON.stringify(msg));
+    log("→ update " + JSON.stringify(msg), "small");
+  }
+
+  function debouncedUpdate() {
+    if (!chkAutoUpdate.checked) return;
+    if (autoUpdateTimer) clearTimeout(autoUpdateTimer);
+    autoUpdateTimer = setTimeout(sendUpdate, 150);
+  }
+
+  function linkRangeNumber(range, number, cb) {
+    const sync = (fromRange) => {
+      if (fromRange) number.value = range.value;
+      else range.value = number.value;
+      cb?.();
+    };
+    range.addEventListener("input", () => { sync(true); debouncedUpdate(); });
+    number.addEventListener("input", () => { sync(false); debouncedUpdate(); });
+    sync(true);
+  }
+
+    function centroidWeightsCSV() {
+    const vals = [numC1, numC2, numC3, numC4, numC5].map(n => {
+      const v = parseFloat(n.value);
+      return Number.isFinite(v) ? v : 0;
+    });
+    // Trim trailing zeros to avoid sending long tails of 0.00s
+    let end = vals.length;
+    while (end > 0 && Math.abs(vals[end-1]) < 1e-9) end--;
+    return vals.slice(0, end).join(",");
+  }
+
+  // Wire sliders
+  linkRangeNumber(rngTemp, numTemp);
+  linkRangeNumber(rngGuid, numGuid);
+  linkRangeNumber(rngTopk, numTopk);
+  linkRangeNumber(rngVol,  numVol, () => { if (gain) gain.gain.value = parseFloat(numVol.value); });
+
+  linkRangeNumber(rngMean, numMean);
+  linkRangeNumber(rngC1, numC1);
+  linkRangeNumber(rngC2, numC2);
+  linkRangeNumber(rngC3, numC3);
+  linkRangeNumber(rngC4, numC4);
+  linkRangeNumber(rngC5, numC5);
+
+  async function start() {
+    if (connected) return;
+    if (!AudioCtx) { alert("Web Audio API not supported"); return; }
+    pending = [];
+    playing = false;
+    ctx = ctx || new AudioCtx();
+    await ctx.resume();
+    gain = ctx.createGain();
+    gain.gain.value = parseFloat(numVol.value);
+    gain.connect(ctx.destination);
+    clearSchedule();
+
+    ws = new WebSocket(wsUrl.value);
+    ws.binaryType = chkBinary.checked ? "arraybuffer" : "blob"; // arraybuffer for raw, blob for JSON string frames
+    setStatus("connecting...");
+    log("connecting " + wsUrl.value);
+
+    ws.onopen = () => {
+      connected = true;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      setStatus("connected");
+
+      const msg = {
+        type: "start",
+        mode: "rt",
+        binary_audio: !!chkBinary.checked,
+        params: {
+          ...currentParams(),
+          pace: $("chkBootstrap").checked
+            ? "asap"       // build pre-roll as fast as possible, then we’ll flip
+            : ($("chkRealtime").checked ? "realtime" : "asap")
+        }
+      };
+      ws.send(JSON.stringify(msg));
+      log("→ start " + JSON.stringify(msg), "ok");
+      nextTime = ctx.currentTime + 0.12;
+    };
+
+    ws.onmessage = async (ev) => {
+      try {
+        if (typeof ev.data === "string") {
+          // JSON (e.g., chunk with base64, status, errors)
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "chunk" && msg.audio_base64) {
+            const buf = base64ToArrayBuffer(msg.audio_base64);
+            if (chkLogAudio.checked) log(`chunk (b64) ${buf.byteLength} bytes`, "small");
+            scheduleWavBytes(buf);
+          } else if (msg.type === "chunk_meta") {
+            // meta for previous binary frame
+          } else if (msg.type === "status") {
+            log("status: " + JSON.stringify(msg), "small");
+          } else if (msg.type === "started") {
+            log("started: " + JSON.stringify(msg), "ok");
+          } else if (msg.type === "error") {
+            log("error: " + msg.error, "err");
+          } else {
+            log("msg: " + JSON.stringify(msg), "small");
+          }
+        } else if (ev.data instanceof Blob) {
+          // Could be binary WAV frame if server sent bytes, or a JSON blob
+          const ab = await ev.data.arrayBuffer();
+          // Try to sniff if this is JSON (starts with '{')
+          if (ab.byteLength > 0 && new Uint8Array(ab, 0, 1)[0] === 0x7b) {
+            const txt = new TextDecoder().decode(ab);
+            const msg = JSON.parse(txt);
+            if (msg.type === "chunk_meta") {
+              // ignore for now
+            } else {
+              log("blob-json: " + txt, "small");
+            }
+          } else {
+            if (chkLogAudio.checked) log(`chunk (bin) ${ab.byteLength} bytes`, "small");
+            scheduleWavBytes(ab);
+          }
+        } else if (ev.data instanceof ArrayBuffer) {
+          const ab = ev.data;
+          if (chkLogAudio.checked) log(`chunk (ab) ${ab.byteLength} bytes`, "small");
+          scheduleWavBytes(ab);
+        }
+      } catch (e) {
+        log("onmessage error: " + e.message, "err");
+      }
+    };
+
+    ws.onclose = () => {
+      connected = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setStatus("closed");
+      log("connection closed", "warn");
+    };
+
+    ws.onerror = (e) => {
+      log("ws error", "err");
+    };
+  }
+
+  function stop() {
+    if (!connected) return;
+    try {
+      ws?.send(JSON.stringify({ type: "stop" }));
+    } catch {}
+    ws?.close();
+    connected = false;
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    setStatus("stopped");
+    clearSchedule();
+    log("stopped", "warn");
+  }
+
+  btnStart.addEventListener("click", start);
+  btnStop.addEventListener("click", stop);
+  btnPing.addEventListener("click", () => { try { ws?.send(JSON.stringify({ type: "ping"})); } catch {} });
+  btnUpdate.addEventListener("click", sendUpdate);
+  // --- Health check & UI gating ---
+  const banner = document.getElementById("healthBanner");
+  async function checkHealthAndGate() {
+    try {
+      const r = await fetch("/health", {cache: "no-store"});
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.ok === false) {
+        const msg = data?.message || "Service unavailable";
+        banner.innerHTML = `<div style="padding:10px;border-radius:8px;background:#3a1010;border:1px solid #712020">
+          <strong>Not ready:</strong> ${msg}<br><small>Status: ${data?.status || r.status}</small>
+        </div>`;
+        // disable controls
+        ["btnStart","btnSelectModel"].forEach(id => { const el = $(id); if (el) el.disabled = true; });
+      } else {
+        banner.innerHTML = `<div style="padding:10px;border-radius:8px;background:#0f2d17;border:1px solid #1f6a37">
+          <strong>Ready</strong> — mode: ${data.mode}, warmed: ${data.warmed}
+        </div>`;
+        ["btnStart","btnSelectModel"].forEach(id => { const el = $(id); if (el) el.disabled = false; });
+      }
+    } catch (e) {
+      banner.innerHTML = `<div style="padding:10px;border-radius:8px;background:#3a2a10;border:1px solid #715820">
+        Health check failed.
+      </div>`;
+    }
+  }
+
+  // --- Model/asset helpers (with base toggle) ---
+  const selRepo = $("selRepo");
+  const selStep = $("selStep");
+  const selSize = $("selSize");
+  const selPrewarm = $("selPrewarm");
+  const selStopActive = $("selStopActive");
+  const btnSelectModel = $("btnSelectModel");
+  const selStatus = $("selStatus");
+  const chkBase = $("chkBase");
+
+  function updateBaseToggleUI() {
+    const base = !!(chkBase && chkBase.checked);
+    if (selRepo) { selRepo.disabled = base; selRepo.parentElement.style.opacity = base ? 0.5 : 1; }
+    if (selStep) { selStep.disabled = base; selStep.parentElement.style.opacity = base ? 0.5 : 1; }
+  }
+  if (chkBase) {
+    chkBase.addEventListener("change", updateBaseToggleUI);
+    updateBaseToggleUI();
+  }
+
+  // Default ws URL to current origin if empty/hardcoded
+  try {
+    const defWs = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/jam";
+    if (!wsUrl.value || /hf\.space/.test(wsUrl.value)) wsUrl.value = defWs;
+  } catch {}
+
+  async function refreshFinetuneControls() {
+    try {
+      const r = await fetch("/model/config", { cache: "no-store" });
+      if (!r.ok) throw new Error("config status " + r.status);
+      const cfg = await r.json();
+      // Use in-memory flags from backend
+      const show = !!(cfg.mean_loaded || cfg.centroids_loaded);
+      const el = document.getElementById("finetuneControls");
+      if (el) el.style.display = show ? "block" : "none";
+      if (!show) log("finetune assets not detected — hiding steering controls", "small");
+    } catch (e) {
+      const el = document.getElementById("finetuneControls");
+      if (el) el.style.display = "none";
+      log("config fetch failed: " + e.message, "warn");
+    }
+  }
+
+  async function selectModel() {
+    selStatus.textContent = "selecting...";
+    try {
+      const useBase = !!(chkBase && chkBase.checked);
+      const payload = {
+        size: (selSize?.value || undefined),
+        prewarm: !!(selPrewarm && selPrewarm.checked),
+        stop_active: !!(selStopActive && selStopActive.checked)
+      };
+      if (useBase) {
+        // Signal stock model: step="none" as per backend's selector
+        payload["step"] = "none";
+      } else {
+        if (selRepo?.value) payload["repo_id"] = selRepo.value;
+        if (selStep?.value) payload["step"] = parseInt(selStep.value, 10);
+      }
+      const resp = await fetch("/model/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.ok === false) {
+        const msg = data?.error || (resp.status + " " + resp.statusText);
+        selStatus.innerHTML = '<span class="err">error: ' + msg + '</span>';
+        log("model/select failed: " + msg, "err");
+        return;
+      }
+      selStatus.innerHTML = '<span class="ok">selected' + (data.warmup_done ? " + warmed" : "") + "</span>";
+      log("model/select ok: " + JSON.stringify(data), "ok");
+      await refreshFinetuneControls();
+    } catch (e) {
+      selStatus.innerHTML = '<span class="err">error: ' + e.message + "</span>";
+      log("model/select exception: " + e.message, "err");
+    }
+  }
+
+  if (btnSelectModel) btnSelectModel.addEventListener("click", selectModel);
+
+  // Run once on load
+  checkHealthAndGate();
+  refreshFinetuneControls();
+
+})();
+</script>
+</body>
+</html>

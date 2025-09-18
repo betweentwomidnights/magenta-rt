@@ -49,7 +49,7 @@ except Exception:
 from magenta_rt import system, audio as au
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Response, Request, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import tempfile, io, base64, math, threading
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import contextmanager
@@ -1606,3 +1606,11 @@ def read_root():
 @app.get("/lil_demo_540p.mp4")
 def demo_video():
     return FileResponse(Path(__file__).parent / "lil_demo_540p.mp4", media_type="video/mp4")
+
+@app.get("/tester", response_class=HTMLResponse)
+def tester():
+    html_path = Path(__file__).parent / "magentaRT_rt_tester.html"
+    return HTMLResponse(
+        html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"}  # avoid sticky caches while iterating
+    )
