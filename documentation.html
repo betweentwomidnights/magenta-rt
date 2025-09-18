@@ -99,13 +99,26 @@
 </head>
 <body>
   <div class="header">
-    <h1>🎵 MagentaRT Research API</h1>
+    <h1>MagentaRT Research API</h1>
     <p class="muted"><strong>AI Music Generation API</strong> • Real-time streaming • Custom fine-tune support</p>
     <span class="badge">Research Project</span>
   </div>
 
+  <div class="section">
+    <h2>what this is</h2>
+    <p>This API serves Google's <a href="https://huggingface.co/google/magenta-realtime" target="_blank">MagentaRT</a> in two distinct ways. First, as a backend for our iOS app (the untitled jamming app) where users create initial loops with Stability AI's <a href="https://huggingface.co/stabilityai/stable-audio-open-small" target="_blank">stable-audio-open-small</a> and then MagentaRT jams on top of that audio context. Second, as a standalone web interface that connects directly to MagentaRT via WebSockets without any audio context.</p>
+    
+    <p>Both modes support switching between base models and custom fine-tunes hosted on Hugging Face. This is designed as a template space for duplication, letting you experiment with real-time music generation outside of Google Colab.</p>
+    
+    <p>This is meant to be duplicated to your own GPU-enabled space since the iOS app is still in active development and doesn't have funding to support multiple concurrent users yet.</p>
+    
+    <div class="info">
+      <strong>Hardware Requirements:</strong> Optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB almost works but will not achieve real-time performance (if someone knows an optimization that will solve this, please let me know).
+    </div>
+  </div>
+
   <section id="env-vars" style="margin-top: 24px;">
-  <h3>⚙️ Environment variables (optional, but helpful)</h3>
+  <h3>environment variables (optional, but helpful)</h3>
   <p>
     You can boot this Space directly into your own finetune by setting the variables below in
     <em>Settings → Variables and secrets → Variables</em>. If you don't set them, you can still
@@ -182,7 +195,7 @@
 </p>
 
   <div class="demo-placeholder">
-  <h3>📱 App Demo Video</h3>
+  <h3>app demo video</h3>
   <video controls preload="metadata" playsinline style="width:100%; border-radius:8px; max-width:540px; display:block; margin:0 auto">
     <source src="./lil_demo_540p.mp4" type="video/mp4">
     Your browser does not support the video tag.
@@ -191,19 +204,15 @@
 </div>
 
   <div class="section">
-    <h2>Overview</h2>
+    <h2>overview</h2>
     <p>This API powers AI music generation using Google's MagentaRT, designed for real-time audio streaming using finetunes hosted on HF. Built for iOS app integration with WebSocket streaming support.</p>
-    
-    <div class="info">
-      <strong>Hardware Requirements:</strong> Optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB almost works but will not achieve real-time performance (if someone knows an optimization that will solve this, please let me know).
-    </div>
   </div>
 
   <div class="section">
-    <h2>Quick Start - WebSocket Streaming</h2>
+    <h2>quick start - WebSocket streaming</h2>
     <p>Connect to <code>wss://&lt;your-space&gt;/ws/jam</code> for real-time audio generation:</p>
 
-    <h3>Start Real-time Generation</h3>
+    <h3>start real-time generation</h3>
     <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
   "type": "start",
   "mode": "rt",
@@ -221,7 +230,7 @@
   }
 }</pre>
 
-    <h3>Update Parameters Live</h3>
+    <h3>update parameters live</h3>
     <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
   "type": "update",
   "styles": "jazz, hiphop",
@@ -233,12 +242,12 @@
   "centroid_weights": "0.1, 0.3, 0.0"
 }</pre>
 
-    <h3>Stop Generation</h3>
+    <h3>stop generation</h3>
     <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{"type": "stop"}</pre>
   </div>
 
   <div class="section">
-    <h2>API Endpoints</h2>
+    <h2>API endpoints</h2>
     
     <div class="endpoint">
       <strong>POST /generate</strong> - Generate 4–8 bars of music with input audio
@@ -274,14 +283,14 @@
   </div>
 
   <div class="section">
-    <h2>Custom Fine-Tuning</h2>
+    <h2>custom fine-tuning</h2>
     <p>Train your own MagentaRT models and use them with this API and the iOS app.</p>
 
     <div class="grid">
       <div class="card">
-        <h3>1. Train Your Model</h3>
+        <h3>1. train your model</h3>
         <p>Use the official MagentaRT fine-tuning notebook:</p>
-        <p><a href="https://github.com/magenta-realtime/notebooks/blob/main/Magenta_RT_Finetune.ipynb" target="_blank">🔗 MagentaRT Fine-tuning Colab</a></p>
+        <p><a href="https://github.com/magenta-realtime/notebooks/blob/main/Magenta_RT_Finetune.ipynb" target="_blank">MagentaRT Fine-tuning Colab</a></p>
         <p>This will create checkpoint folders like:</p>
         <ul>
           <li><code>checkpoint_1861001/</code></li>
@@ -291,7 +300,7 @@
       </div>
 
       <div class="card">
-        <h3>2. Package Checkpoints</h3>
+        <h3>2. package checkpoints</h3>
         <p>Checkpoints must be compressed as .tgz files to preserve .zarray files correctly.</p>
         <div class="warning">
           <strong>Important:</strong> Do not download checkpoint folders directly from Google Drive - the .zarray files won't transfer properly.
@@ -299,7 +308,7 @@
       </div>
     </div>
 
-    <h3>Checkpoint Packaging Script</h3>
+    <h3>checkpoint packaging script</h3>
     <p>Use this in a Colab cell to properly package your checkpoints:</p>
     <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button># Mount Drive to access your trained checkpoints
 from google.colab import drive
@@ -325,7 +334,7 @@ CKPT_SRC = '/content/drive/MyDrive/thepatch/checkpoint_1862001'  # Adjust path
 from google.colab import files
 files.download('/content/checkpoint_1862001.tgz')</pre>
 
-    <h3>3. Upload to Hugging Face</h3>
+    <h3>3. upload to hugging face</h3>
     <p>Create a model repository and upload:</p>
     <ul>
       <li>Your <code>.tgz</code> checkpoint files</li>
@@ -338,12 +347,12 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
       Shows the correct file structure with .tgz files and .npy steering assets in the root directory.
     </div>
 
-    <h3>4. Use in the App</h3>
+    <h3>4. use in the app</h3>
     <p>In the iOS app's model selector, point to your Hugging Face repository URL. The app will automatically discover available checkpoints and allow switching between them.</p>
   </div>
 
   <div class="section">
-    <h2>Technical Specifications</h2>
+    <h2>technical specifications</h2>
     <ul>
       <li><strong>Audio Format:</strong> 48 kHz stereo, ~2.0s chunks with ~40ms crossfade</li>
       <li><strong>Model Sizes:</strong> Base and Large variants available</li>
@@ -358,7 +367,7 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
   </div>
 
   <div class="section">
-    <h2>Integration with iOS App</h2>
+    <h2>integration with iOS app</h2>
     <p>This API is designed to work seamlessly with our iOS music generation app:</p>
     <ul>
       <li>Real-time audio streaming via WebSockets</li>
@@ -369,7 +378,7 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
   </div>
 
   <div class="section">
-    <h2>Deployment</h2>
+    <h2>deployment</h2>
     <p>To run your own instance:</p>
     <ol>
       <li>Duplicate this Hugging Face Space</li>
@@ -380,7 +389,7 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
   </div>
 
   <div class="section">
-    <h2>Support & Contact</h2>
+    <h2>support & contact</h2>
     <p>This is an active research project. For questions, technical support, or collaboration:</p>
     <p><strong>Email:</strong> <a href="mailto:kev@thecollabagepatch.com">kev@thecollabagepatch.com</a></p>
     
@@ -390,9 +399,14 @@ files.download('/content/checkpoint_1862001.tgz')</pre>
   </div>
 
   <div class="section">
-    <h2>Licensing</h2>
+    <h2>licensing</h2>
     <p>Built on Google's MagentaRT (Apache 2.0 + CC-BY 4.0). Users are responsible for their generated outputs and ensuring compliance with applicable laws and platform policies.</p>
-    <p><a href="/docs">📖 API Reference Documentation</a></p>
+    <p><a href="/docs">API Reference Documentation</a></p>
+  </div>
+
+  <div class="section">
+    <h2>contributors</h2>
+    <p>Kevin Griffing and Andrew Luck</p>
   </div>
 
   <script>
