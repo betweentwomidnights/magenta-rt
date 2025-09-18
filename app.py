@@ -134,11 +134,12 @@ _CENTROIDS: np.ndarray | None = None            # shape (K, D) dtype float32
 asset_manager = AssetManager()
 model_selector = ModelSelector(CheckpointManager(), asset_manager)
 
-# Sync asset manager with existing globals
-# def _sync_asset_manager():
-#     asset_manager.mean_embed = _MEAN_EMBED
-#     asset_manager.centroids = _CENTROIDS  
-#     asset_manager.assets_repo_id = _ASSETS_REPO_ID
+def _sync_assets_globals_from_manager():
+    # Keeps /model/config in sync with what the asset manager has
+    global _MEAN_EMBED, _CENTROIDS, _ASSETS_REPO_ID
+    _MEAN_EMBED = asset_manager.mean_embed
+    _CENTROIDS = asset_manager.centroids
+    _ASSETS_REPO_ID = asset_manager.assets_repo_id
 
 def _any_jam_running() -> bool:
     with jam_lock:
@@ -335,15 +336,20 @@ def get_mrt():
     if _MRT is None:
         with _MRT_LOCK:
             if _MRT is None:
-                from model_management import CheckpointManager
-                ckpt_dir = CheckpointManager.resolve_checkpoint_dir()  # ← Updated call
+                ckpt_dir = CheckpointManager.resolve_checkpoint_dir()  # uses MRT_CKPT_REPO/STEP if present
                 _MRT = system.MagentaRT(
                     tag=os.getenv("MRT_SIZE", "large"),
                     guidance_weight=5.0,
                     device="gpu",
                     checkpoint_dir=ckpt_dir,
-                    lazy=False,
+                    lazy=False
                 )
+                # If no assets loaded yet, and a repo is configured, load them now.
+                if asset_manager.mean_embed is None and asset_manager.centroids is None:
+                    repo = os.getenv("MRT_ASSETS_REPO") or os.getenv("MRT_CKPT_REPO")
+                    if repo:
+                        asset_manager.load_finetune_assets_from_hf(repo, None)
+                        _sync_assets_globals_from_manager()
     return _MRT
 
 _WARMED = False
@@ -420,9 +426,18 @@ def _mrt_warmup():
 # startup and model selection
 # ----------------------------
 
-# Kick it off in the background on server start
 @app.on_event("startup")
-def _kickoff_warmup():
+def _boot():
+    # 1) Load finetune assets up front (only if envs are present)
+    repo = os.getenv("MRT_ASSETS_REPO") or os.getenv("MRT_CKPT_REPO")
+    if repo:
+        ok, msg = asset_manager.load_finetune_assets_from_hf(repo, None)
+        _sync_assets_globals_from_manager()  # keep /model/config in sync
+        logging.info("Startup asset load from %s: %s", repo, "ok" if ok else msg)
+    else:
+        logging.info("Startup asset load: no repo env set; skipping.")
+
+    # 2) Start warmup in the background (unchanged behavior)
     if os.getenv("MRT_WARMUP", "1") != "0":
         threading.Thread(target=_mrt_warmup, name="mrt-warmup", daemon=True).start()
 
@@ -556,6 +571,8 @@ def model_select(req: ModelSelect):
         if "error" in validation_result:
             raise HTTPException(status_code=400, detail=validation_result["error"])
         return {"ok": False, **validation_result}
+    
+
 
     # Augment response surface
     validation_result["active_jam"] = _any_jam_running()
@@ -563,6 +580,10 @@ def model_select(req: ModelSelect):
     # Dry-run path
     if req.dry_run:
         return {"ok": True, "dry_run": True, **validation_result}
+    
+    if req.ckpt_step == "none":  # user asked for stock base
+        asset_manager.clear_assets()       # implement .clear_assets() to set embeds/centroids to None
+        _sync_assets_globals_from_manager()
 
     # 2) Handle jam policy
     if _any_jam_running():
