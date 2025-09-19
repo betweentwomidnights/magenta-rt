@@ -243,6 +243,11 @@
   const queueEl = $("queue");
   const logEl = $("log");
 
+  // --- Ring buffer logging (batched with rAF) ---
+  const LOG_MAX = 200;           // keep last N lines
+  let   logBuf = [];             // [{msg, cls}]
+  let   logFlushScheduled = false;
+
   const rngMean = $("rngMean"), numMean = $("numMean");
   const rngC1 = $("rngC1"), numC1 = $("numC1");
   const rngC2 = $("rngC2"), numC2 = $("numC2");
@@ -307,12 +312,35 @@ function beginPlaybackFromPending() {
   let connected = false;
   let autoUpdateTimer = null;
 
+  /**
+   * Push a line into the log ring and schedule a single repaint via rAF.
+   * This avoids per-append DOM work and forced reflow during capture.
+   */
   function log(msg, cls) {
-    const line = document.createElement("div");
-    line.textContent = msg;
-    if (cls) line.className = cls;
-    logEl.appendChild(line);
-    logEl.scrollTop = logEl.scrollHeight;
+    logBuf.push({ msg: String(msg), cls: cls || "" });
+    // Trim oldest if we exceed capacity
+    if (logBuf.length > LOG_MAX) {
+      logBuf.splice(0, logBuf.length - LOG_MAX);
+    }
+    if (!logFlushScheduled) {
+      logFlushScheduled = true;
+      requestAnimationFrame(flushLog);
+    }
+  }
+  function flushLog() {
+    logFlushScheduled = false;
+    // If user is already at bottom, keep them there after the flush
+    const atBottom = (logEl.scrollTop + logEl.clientHeight + 4) >= logEl.scrollHeight;
+    // Rebuild using a fragment (fast for ~200 nodes)
+    const frag = document.createDocumentFragment();
+    for (const {msg, cls} of logBuf) {
+      const div = document.createElement("div");
+      if (cls) div.className = cls;
+      div.textContent = msg;
+      frag.appendChild(div);
+    }
+    logEl.replaceChildren(frag);
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
   }
 
   function setStatus(txt) {
