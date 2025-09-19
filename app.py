@@ -1641,3 +1641,9 @@ def tester():
         html_path.read_text(encoding="utf-8"),
         headers={"Cache-Control": "no-store"}  # avoid sticky caches while iterating
     )
+
+@app.get("/magenta_prompts.js")
+def magenta_prompts_js():
+    js_path = Path(__file__).parent / "magenta_prompts.js"
+    return FileResponse(js_path, media_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
