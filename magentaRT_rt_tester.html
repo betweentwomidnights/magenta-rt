@@ -106,8 +106,6 @@
         <label class="small"><input id="chkAutoUpdate" type="checkbox" checked /> Auto-update on slider change (150ms debounce)</label>
         <label class="small"><input id="chkLogAudio" type="checkbox" /> Log chunk sizes</label>
         <label class="small"><input id="chkRealtime" type="checkbox" checked /> Ask server to pace real-time</label>
-        <!-- <label class="small"><input id="chkBootstrap" type="checkbox" checked /> Bootstrap fast (ASAP → flip to realtime)</label>
-        <label class="small">Pre-roll chunks: <input id="numPreroll" type="number" min="0" max="12" step="1" value="3" style="width:60px"></label> -->
       </div>
     </div>
   </div>
@@ -241,8 +239,6 @@
   const rngGuid = $("rngGuid"), numGuid = $("numGuid");
   const rngTopk = $("rngTopk"), numTopk = $("numTopk");
   const rngVol = $("rngVol"), numVol = $("numVol");
-  // const txtStyles = $("txtStyles");
-  // const txtStyleWeights = $("txtStyleWeights");
   const chkUseMixStyle = $("chkUseMixStyle");
   const statusEl = $("status");
   const queueEl = $("queue");
@@ -268,8 +264,19 @@ const START_CUSHION = 0.12;  // already used
 
 const fade = XFADE_MS / 1000;
 
+// Equal-power crossfading functions
+function equalPowerFadeOut(t) {
+  // cos²(t * π/2) where t goes from 0 to 1
+  return Math.cos(t * Math.PI / 2) ** 2;
+}
+
+function equalPowerFadeIn(t) {
+  // sin²(t * π/2) where t goes from 0 to 1
+  return Math.sin(t * Math.PI / 2) ** 2;
+}
+
 function scheduleAudioBuffer(abuf) {
-  // Overlap-add crossfade scheduling (same as your scheduleWavBytes but taking a decoded buffer)
+  // Equal-power crossfade scheduling
   const src = ctx.createBufferSource();
   const g = ctx.createGain();
   src.buffer = abuf;
@@ -279,13 +286,47 @@ function scheduleAudioBuffer(abuf) {
   const startAt = nextTime;
   const dur = abuf.duration;
 
-  // Overlap by 'fade' so there’s no dip
+  // Overlap by 'fade' so there's no dip
   nextTime = startAt + Math.max(0, dur - fade);
 
-  g.gain.setValueAtTime(0.0, startAt);
-  g.gain.linearRampToValueAtTime(1.0, startAt + fade);
-  g.gain.setValueAtTime(1.0, startAt + Math.max(0, dur - fade));
-  g.gain.linearRampToValueAtTime(0.0, startAt + dur);
+  // Equal-power crossfading using custom curves
+  const numPoints = 64; // More points for smoother curves
+  const times = [];
+  const values = [];
+  
+  // Fade in from 0 to 1 over fade duration
+  for (let i = 0; i <= numPoints; i++) {
+    const t = i / numPoints;
+    const time = startAt + t * fade;
+    const value = equalPowerFadeIn(t);
+    times.push(time);
+    values.push(value);
+  }
+  
+  // Hold at 1.0 during the main portion
+  const holdStart = startAt + fade;
+  const holdEnd = startAt + Math.max(0, dur - fade);
+  if (holdEnd > holdStart) {
+    times.push(holdStart);
+    values.push(1.0);
+    times.push(holdEnd);
+    values.push(1.0);
+  }
+  
+  // Fade out from 1 to 0 over fade duration
+  for (let i = 0; i <= numPoints; i++) {
+    const t = i / numPoints;
+    const time = startAt + Math.max(0, dur - fade) + t * fade;
+    const value = equalPowerFadeOut(t);
+    times.push(time);
+    values.push(value);
+  }
+
+  // Apply the envelope
+  g.gain.setValueAtTime(values[0], times[0]);
+  for (let i = 1; i < times.length; i++) {
+    g.gain.linearRampToValueAtTime(values[i], times[i]);
+  }
 
   src.start(startAt);
   scheduled.push({ src, when: startAt, dur });
@@ -301,10 +342,6 @@ function beginPlaybackFromPending() {
     const abuf = pending.shift();
     scheduleAudioBuffer(abuf);
   }
-  // Flip server pacing to realtime after we’ve started, if bootstrapping was enabled
-  // if ($("chkBootstrap").checked) {
-  //   try { ws?.send(JSON.stringify({ type: "update", pace: "realtime" })); } catch {}
-  // }
 }
 
   // Audio chain
