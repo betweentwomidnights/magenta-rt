@@ -990,6 +990,21 @@ def jam_stop(session_id: str = Body(..., embed=True)):
         jam_registry.pop(session_id, None)
     return {"stopped": True}
 
+@app.post("/jam/stop_all")
+def jam_stop_all():
+    """Force stop all active jam sessions (nuclear option for cleanup)"""
+    stopped_sessions = []
+    
+    with jam_lock:
+        for session_id, worker in list(jam_registry.items()):
+            if worker.is_alive():
+                worker.stop()
+                worker.join(timeout=2.0)
+                stopped_sessions.append(session_id)
+            jam_registry.pop(session_id, None)
+    
+    return {"stopped_sessions": stopped_sessions, "count": len(stopped_sessions)}
+
 @app.post("/jam/update")
 def jam_update(
     session_id: str = Form(...),
