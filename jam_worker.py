@@ -1,4 +1,4 @@
-# jam_worker.py - Bar-locked spool rewrite
+# jam_worker.py - Updated with robust silence handling
 from __future__ import annotations
 
 import os
@@ -20,7 +20,6 @@ from utils import (
 )
 
 def _dbg_rms_dbfs(x: np.ndarray) -> float:
-    
     if x.ndim == 2:
         x = x.mean(axis=1)
     r = float(np.sqrt(np.mean(x * x) + 1e-12))
@@ -28,7 +27,6 @@ def _dbg_rms_dbfs(x: np.ndarray) -> float:
 
 def _dbg_rms_dbfs_model(x: np.ndarray) -> float:
     # x is model-rate, shape [S,C] or [S]
-    
     if x.ndim == 2:
         x = x.mean(axis=1)
     r = float(np.sqrt(np.mean(x * x) + 1e-12))
@@ -36,6 +34,19 @@ def _dbg_rms_dbfs_model(x: np.ndarray) -> float:
 
 def _dbg_shape(x):
     return tuple(x.shape) if hasattr(x, "shape") else ("-",)
+
+def _is_silent(audio: np.ndarray, threshold_db: float = -60.0) -> bool:
+    """Check if audio is effectively silent."""
+    if audio.size == 0:
+        return True
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    rms = float(np.sqrt(np.mean(audio**2)))
+    return 20.0 * np.log10(max(rms, 1e-12)) < threshold_db
+
+def _has_energy(audio: np.ndarray, threshold_db: float = -40.0) -> bool:
+    """Check if audio has significant energy (stricter than just non-silent)."""
+    return not _is_silent(audio, threshold_db)
 
 # -----------------------------
 # Data classes
@@ -55,7 +66,7 @@ class JamParams:
     guidance_weight: float = 1.1
     temperature: float = 1.1
     topk: int = 40
-    style_ramp_seconds: float = 8.0  # 0 => instant (current behavior), try 6.0–10.0 for gentle glides
+    style_ramp_seconds: float = 8.0
 
 
 @dataclass
@@ -110,8 +121,6 @@ class JamWorker(threading.Thread):
         self.mrt.temperature     = float(self.params.temperature)
         self.mrt.topk            = int(self.params.topk)
 
-        
-
         # codec/setup
         self._codec_fps = float(self.mrt.codec.frame_rate)
         JamWorker.FRAMES_PER_SECOND = self._codec_fps
@@ -137,8 +146,9 @@ class JamWorker(threading.Thread):
         self._spool = np.zeros((0, 2), dtype=np.float32)   # (S,2) target SR
         self._spool_written = 0                            # absolute frames written into spool
 
-        self._pending_tail_model = None      # type: Optional[np.ndarray]  # last tail at model SR
-        self._pending_tail_target_len = 0    # number of target-SR samples last tail contributed
+        # Health monitoring
+        self._silence_streak = 0  # consecutive silent chunks
+        self._last_good_context_tokens = None  # backup of last known good context
 
         # bar clock: start with offset 0; if you have a downbeat estimator, set base later
         self._bar_clock = BarClock(self.params.target_sr, self.params.bpm, self.params.beats_per_bar, base_offset_samples=0)
@@ -163,6 +173,47 @@ class JamWorker(threading.Thread):
         # Prepare initial context from combined loop (best musical alignment)
         if self.params.combined_loop is not None:
             self._install_context_from_loop(self.params.combined_loop)
+            # Save this as our "good" context backup
+            if hasattr(self.state, 'context_tokens') and self.state.context_tokens is not None:
+                self._last_good_context_tokens = np.copy(self.state.context_tokens)
+
+    # ---------- NEW: Health monitoring methods ----------
+
+    def _check_model_health(self, new_chunk: np.ndarray) -> bool:
+        """Check if the model output looks healthy."""
+        if _is_silent(new_chunk, threshold_db=-80.0):
+            self._silence_streak += 1
+            print(f"⚠️  Silent chunk detected (streak: {self._silence_streak})")
+            return False
+        else:
+            if self._silence_streak > 0:
+                print(f"✅ Audio resumed after {self._silence_streak} silent chunks")
+            self._silence_streak = 0
+            return True
+
+    def _recover_from_silence(self):
+        """Attempt to recover from silence by restoring last good context."""
+        print("🔧 Attempting recovery from silence...")
+        
+        if self._last_good_context_tokens is not None:
+            # Restore last known good context
+            try:
+                new_state = self.mrt.init_state()
+                new_state.context_tokens = np.copy(self._last_good_context_tokens)
+                self.state = new_state
+                self._model_stream = None  # Reset stream to start fresh
+                print("   Restored last good context")
+            except Exception as e:
+                print(f"   Context restoration failed: {e}")
+        
+        # If we have the original loop, rebuild context from it
+        elif self.params.combined_loop is not None:
+            try:
+                self._install_context_from_loop(self.params.combined_loop)
+                self._model_stream = None
+                print("   Rebuilt context from original loop")
+            except Exception as e:
+                print(f"   Context rebuild failed: {e}")
 
     # ---------- lifecycle ----------
 
@@ -248,13 +299,7 @@ class JamWorker(threading.Thread):
         return toks
 
     def _encode_exact_context_tokens(self, loop: au.Waveform) -> np.ndarray:
-        """Build *exactly* context_length_frames worth of tokens (e.g., 250 @ 25fps),
-        while ensuring the *end* of the audio lands on a bar boundary.
-        Strategy: take the largest integer number of bars <= ctx_seconds as the tail,
-        then left-fill from just before that tail (wrapping if needed) to reach exactly
-        ctx_seconds; finally, pad/trim to exact samples and, as a last resort, pad/trim
-        tokens to the expected frame count.
-        """
+        """Build *exactly* context_length_frames worth of tokens, ensuring bar alignment."""
         wav = loop.as_stereo().resample(self._model_sr)
         data = wav.samples.astype(np.float32, copy=False)
         if data.ndim == 1:
@@ -289,8 +334,14 @@ class JamWorker(threading.Thread):
 
         # final snap to *exact* ctx samples
         if ctx.shape[0] < ctx_samps:
-            pad = np.zeros((ctx_samps - ctx.shape[0], ctx.shape[1]), dtype=np.float32)
-            ctx = np.concatenate([pad, ctx], axis=0)
+            # Instead of zero padding, repeat the audio to fill
+            shortfall = ctx_samps - ctx.shape[0]
+            if ctx.shape[0] > 0:
+                fill = np.tile(ctx, (int(np.ceil(shortfall / ctx.shape[0])) + 1, 1))[:shortfall]
+                ctx = np.concatenate([fill, ctx], axis=0)
+            else:
+                print("⚠️  Zero-length context, using fallback")
+                ctx = np.zeros((ctx_samps, 2), dtype=np.float32)
         elif ctx.shape[0] > ctx_samps:
             ctx = ctx[-ctx_samps:]
 
@@ -301,71 +352,12 @@ class JamWorker(threading.Thread):
 
         # Force expected (F,D) at *return time*
         tokens = self._coerce_tokens(tokens)
+        
+        # Validate that we don't have a silent context
+        if _is_silent(ctx, threshold_db=-80.0):
+            print("⚠️  Generated silent context - this may cause issues")
+        
         return tokens
-
-    def _encode_exact_context_tokens(self, loop: au.Waveform) -> np.ndarray:
-        """Build *exactly* context_length_frames worth of tokens (e.g., 250 @ 25fps),
-        while ensuring the *end* of the audio lands on a bar boundary.
-        Strategy: take the largest integer number of bars <= ctx_seconds as the tail,
-        then left-fill from just before that tail (wrapping if needed) to reach exactly
-        ctx_seconds; finally, pad/trim to exact samples and, as a last resort, pad/trim
-        tokens to the expected frame count.
-        """
-        wav = loop.as_stereo().resample(self._model_sr)
-        data = wav.samples.astype(np.float32, copy=False)
-        if data.ndim == 1:
-            data = data[:, None]
-
-        spb = self._bar_clock.seconds_per_bar()
-        ctx_sec = float(self._ctx_seconds)
-        sr = int(self._model_sr)
-
-        # bars that fit fully inside ctx_sec (at least 1)
-        bars_fit = max(1, int(ctx_sec // spb))
-        tail_len_samps = int(round(bars_fit * spb * sr))
-
-        # ensure we have enough source by tiling
-        need = int(round(ctx_sec * sr)) + tail_len_samps
-        if data.shape[0] == 0:
-            data = np.zeros((1, 2), dtype=np.float32)
-        reps = int(np.ceil(need / float(data.shape[0])))
-        tiled = np.tile(data, (reps, 1))
-
-        end = tiled.shape[0]
-        tail = tiled[end - tail_len_samps:end]
-
-        # left-fill to reach exact ctx samples (keeps end-of-bar alignment)
-        ctx_samps = int(round(ctx_sec * sr))
-        pad_len = ctx_samps - tail.shape[0]
-        if pad_len > 0:
-            pre = tiled[end - tail_len_samps - pad_len:end - tail_len_samps]
-            ctx = np.concatenate([pre, tail], axis=0)
-        else:
-            ctx = tail[-ctx_samps:]
-
-        # final snap to *exact* ctx samples
-        if ctx.shape[0] < ctx_samps:
-            pad = np.zeros((ctx_samps - ctx.shape[0], ctx.shape[1]), dtype=np.float32)
-            ctx = np.concatenate([pad, ctx], axis=0)
-        elif ctx.shape[0] > ctx_samps:
-            ctx = ctx[-ctx_samps:]
-
-        exact = au.Waveform(ctx, sr)
-        tokens_full = self.mrt.codec.encode(exact).astype(np.int32)
-        depth = int(self.mrt.config.decoder_codec_rvq_depth)
-        tokens = tokens_full[:, :depth]
-
-        # Last defense: force expected frame count
-        frames = tokens.shape[0]
-        exp = int(self._ctx_frames)
-        if frames < exp:
-            # repeat last frame
-            pad = np.repeat(tokens[-1:, :], exp - frames, axis=0)
-            tokens = np.concatenate([pad, tokens], axis=0)
-        elif frames > exp:
-            tokens = tokens[-exp:, :]
-        return tokens
-
 
     def _install_context_from_loop(self, loop: au.Waveform):
         # Build exact-length, bar-locked context tokens
@@ -373,7 +365,7 @@ class JamWorker(threading.Thread):
         s = self.mrt.init_state()
         s.context_tokens = context_tokens
         self.state = s
-        self._original_context_tokens = np.copy(context_tokens)
+        self._last_good_context_tokens = np.copy(context_tokens)
 
     def reseed_from_waveform(self, wav: au.Waveform):
         """Immediate reseed: replace context from provided wave (bar-locked, exact length)."""
@@ -383,14 +375,11 @@ class JamWorker(threading.Thread):
             s.context_tokens = context_tokens
             self.state = s
             self._model_stream = None  # drop model-domain continuity so next chunk starts cleanly
-            self._original_context_tokens = np.copy(context_tokens)
+            self._last_good_context_tokens = np.copy(context_tokens)
+            self._silence_streak = 0  # Reset health monitoring
 
     def reseed_splice(self, recent_wav: au.Waveform, anchor_bars: float):
-        """Queue a *seamless* reseed by token splicing instead of full restart.
-        We compute a fresh, bar-locked context token tensor of exact length
-        (e.g., 250 frames), then splice only the *tail* corresponding to
-        `anchor_bars` so generation continues smoothly without resetting state.
-        """
+        """Queue a *seamless* reseed by token splicing instead of full restart."""
         new_ctx = self._encode_exact_context_tokens(recent_wav)  # coerce to (F,D)
         F, D = self._expected_token_shape()
 
@@ -419,44 +408,20 @@ class JamWorker(threading.Thread):
                 "tokens": spliced,
                 "debug": {"F": F, "D": D, "splice_frames": splice_frames, "frames_per_bar": frames_per_bar}
             }
-            
 
-
-    def reseed_from_waveform(self, wav: au.Waveform):
-        """Immediate reseed: replace context from provided wave (bar-aligned tail)."""
-        wav = wav.as_stereo().resample(self._model_sr)
-        tail = take_bar_aligned_tail(wav, self.params.bpm, self.params.beats_per_bar, self._ctx_seconds)
-        tokens_full = self.mrt.codec.encode(tail).astype(np.int32)
-        depth = int(self.mrt.config.decoder_codec_rvq_depth)
-        context_tokens = tokens_full[:, :depth]
-
-        s = self.mrt.init_state()
-        s.context_tokens = context_tokens
-        self.state = s
-        # reset model stream so next generate starts cleanly
-        self._model_stream = None
-
-        # optional loudness match will be applied per-chunk on emission
-
-        # also remember this as new "original"
-        self._original_context_tokens = np.copy(context_tokens)
-
-    # ---------- core streaming helpers ----------
+    # ---------- REWRITTEN: core streaming helpers ----------
 
     def _append_model_chunk_and_spool(self, wav: au.Waveform) -> None:
         """
-        Conservative boundary fix:
-        - Emit body+tail immediately (target SR), unchanged from your original behavior.
-        - On *next* call, compute the mixed overlap (prev tail ⨉ cos + new head ⨉ sin),
-        resample it, and overwrite the last `_pending_tail_target_len` samples in the
-        target-SR spool with that mixed overlap. Then emit THIS chunk's body+tail and
-        remember THIS chunk's tail length at target SR for the next correction.
-
-        This keeps external timing and bar alignment identical, but removes the audible
-        fade-to-zero at chunk ends.
+        REWRITTEN: Robust audio processing with silence detection and health monitoring.
+        
+        Strategy:
+        1. Validate input chunk for silence/issues
+        2. Use simpler crossfading that handles silence gracefully  
+        3. Update model stream with health checks
+        4. Convert to target SR and append to spool
         """
-
-        # ---- unpack model-rate samples ----
+        # Unpack model-rate samples
         s = wav.samples.astype(np.float32, copy=False)
         if s.ndim == 1:
             s = s[:, None]
@@ -464,119 +429,90 @@ class JamWorker(threading.Thread):
         if n_samps == 0:
             return
 
-        # crossfade length in model samples
+        # Health check on new chunk
+        is_healthy = self._check_model_health(s)
+        
+        # Get crossfade params
         try:
             xfade_s = float(self.mrt.config.crossfade_length)
         except Exception:
             xfade_s = 0.0
         xfade_n = int(round(max(0.0, xfade_s) * float(self._model_sr)))
 
-        # helper: resample to target SR via your streaming resampler
+        print(f"[model] chunk len={n_samps} rms={_dbg_rms_dbfs_model(s):+.1f} dBFS healthy={is_healthy}")
+
+        # Helper: resample to target SR
         def to_target(y: np.ndarray) -> np.ndarray:
             return y if self._rs is None else self._rs.process(y, final=False)
 
-        # ------------------------------------------
-        # (A) If we have a pending model tail, fix the last emitted tail at target SR
-        # ------------------------------------------
-        if self._pending_tail_model is not None and self._pending_tail_model.shape[0] == xfade_n and xfade_n > 0 and n_samps >= xfade_n:
-            head = s[:xfade_n, :]
-
-            print(f"[model] head    len={head.shape[0]} rms={_dbg_rms_dbfs_model(head):+.1f} dBFS")
-
-            t = np.linspace(0.0, np.pi/2.0, xfade_n, endpoint=False, dtype=np.float32)[:, None]
-            cosw = np.cos(t, dtype=np.float32)
-            sinw = np.sin(t, dtype=np.float32)
-            mixed_model = (self._pending_tail_model * cosw) + (head * sinw)  # [xfade_n, C] at model SR
-
-            y_mixed = to_target(mixed_model.astype(np.float32))
-            Lcorr = int(y_mixed.shape[0])  # exact target-SR samples to write
-
-            # DEBUG: corrected overlap RMS (what we intend to hear at the boundary)
-            if y_mixed.size:
-                print(f"[append] mixedOverlap len={y_mixed.shape[0]} rms={_dbg_rms_dbfs(y_mixed):+.1f} dBFS")
-
-            # Overwrite the last `_pending_tail_target_len` samples of the spool with `y_mixed`.
-            # Use the *smaller* of the two lengths to be safe.
-            Lpop = min(self._pending_tail_target_len, self._spool.shape[0], Lcorr)
-            if Lpop > 0 and self._spool.size:
-                # Trim last Lpop samples
-                self._spool = self._spool[:-Lpop, :]
-                self._spool_written -= Lpop
-                # Append corrected overlap (trim/pad to Lpop to avoid drift)
-                if Lcorr != Lpop:
-                    if Lcorr > Lpop:
-                        y_m = y_mixed[-Lpop:, :]
-                    else:
-                        pad = np.zeros((Lpop - Lcorr, y_mixed.shape[1]), dtype=np.float32)
-                        y_m = np.concatenate([y_mixed, pad], axis=0)
-                else:
-                    y_m = y_mixed
-                self._spool = np.concatenate([self._spool, y_m], axis=0) if self._spool.size else y_m
-                self._spool_written += y_m.shape[0]
-
-            # For internal continuity, update _model_stream like before
-            if self._model_stream is None or self._model_stream.shape[0] < xfade_n:
-                self._model_stream = s[xfade_n:].copy()
-            else:
-                self._model_stream = np.concatenate([self._model_stream[:-xfade_n], mixed_model, s[xfade_n:]], axis=0)
+        # --- SIMPLIFIED CROSSFADE LOGIC ---
+        
+        if self._model_stream is None:
+            # First chunk - no crossfading needed
+            self._model_stream = s.copy()
+            
+        elif xfade_n <= 0 or n_samps < xfade_n:
+            # No crossfade configured or chunk too short - simple append
+            self._model_stream = np.concatenate([self._model_stream, s], axis=0)
+            
+        elif _is_silent(self._model_stream[-xfade_n:]) or _is_silent(s[:xfade_n]):
+            # One side is silent - don't crossfade, just append
+            print(f"[crossfade] Skipping crossfade due to silence")
+            self._model_stream = np.concatenate([self._model_stream, s], axis=0)
+            
         else:
-            # First-ever call or too-short to mix: maintain _model_stream minimally
-            if xfade_n > 0 and n_samps > xfade_n:
-                self._model_stream = s[xfade_n:].copy() if self._model_stream is None else np.concatenate([self._model_stream, s[xfade_n:]], axis=0)
-            else:
-                self._model_stream = s.copy() if self._model_stream is None else np.concatenate([self._model_stream, s], axis=0)
+            # Normal crossfade between non-silent audio
+            tail = self._model_stream[-xfade_n:]
+            head = s[:xfade_n]
+            body = s[xfade_n:] if n_samps > xfade_n else np.zeros((0, s.shape[1]), dtype=np.float32)
+            
+            # Equal power crossfade
+            t = np.linspace(0.0, 1.0, xfade_n, dtype=np.float32)[:, None]
+            fade_out = np.cos(t * np.pi / 2.0)
+            fade_in = np.sin(t * np.pi / 2.0)
+            
+            mixed = tail * fade_out + head * fade_in
+            
+            print(f"[crossfade] tail rms={_dbg_rms_dbfs_model(tail):+.1f} head rms={_dbg_rms_dbfs_model(head):+.1f} mixed rms={_dbg_rms_dbfs_model(mixed):+.1f}")
+            
+            # Update model stream: remove old tail, add mixed section, add body
+            self._model_stream = np.concatenate([
+                self._model_stream[:-xfade_n],
+                mixed,
+                body
+            ], axis=0)
 
-        # ------------------------------------------
-        # (B) Emit THIS chunk's body and tail (same external behavior)
-        # ------------------------------------------
-        if xfade_n > 0 and n_samps >= (2 * xfade_n):
-            body = s[xfade_n:-xfade_n, :]
-            print(f"[model] body    len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
-            if body.size:
-                y_body = to_target(body.astype(np.float32))
-                if y_body.size:
-                    # DEBUG: body RMS we are actually appending
-                    print(f"[append] body len={y_body.shape[0]} rms={_dbg_rms_dbfs(y_body):+.1f} dBFS")
-                    self._spool = np.concatenate([self._spool, y_body], axis=0) if self._spool.size else y_body
-                    self._spool_written += y_body.shape[0]
-        else:
-            # If chunk too short for head+tail split, treat all (minus preroll) as body
-            if xfade_n > 0 and n_samps > xfade_n:
-                body = s[xfade_n:, :]
-                print(f"[model] body(S) len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
-                y_body = to_target(body.astype(np.float32))
-                if y_body.size:
-                    # DEBUG: body RMS in short-chunk path
-                    print(f"[append] body(len=short) len={y_body.shape[0]} rms={_dbg_rms_dbfs(y_body):+.1f} dBFS")
-                    self._spool = np.concatenate([self._spool, y_body], axis=0) if self._spool.size else y_body
-                    self._spool_written += y_body.shape[0]
-                # No tail to remember this round
-                self._pending_tail_model = None
-                self._pending_tail_target_len = 0
-                return
-
-        # Tail (always remember how many TARGET samples we append)
+        # --- CONVERT AND APPEND TO SPOOL ---
+        
+        # Take the new audio from this iteration (avoid reprocessing old audio)
         if xfade_n > 0 and n_samps >= xfade_n:
-            tail = s[-xfade_n:, :]
-            print(f"[model] tail    len={tail.shape[0]} rms={_dbg_rms_dbfs_model(tail):+.1f} dBFS")
-            y_tail = to_target(tail.astype(np.float32))
-            Ltail = int(y_tail.shape[0])
-            if Ltail:
-                # DEBUG: tail RMS we are appending now (to be corrected next call)
-                print(f"[append] tail len={y_tail.shape[0]} rms={_dbg_rms_dbfs(y_tail):+.1f} dBFS")
-                self._spool = np.concatenate([self._spool, y_tail], axis=0) if self._spool.size else y_tail
-                self._spool_written += Ltail
-                self._pending_tail_model = tail.copy()
-                self._pending_tail_target_len = Ltail
-            else:
-                # Nothing appended (resampler returned nothing yet) — keep model tail but mark zero target len
-                self._pending_tail_model = tail.copy()
-                self._pending_tail_target_len = 0
+            # Normal case: body after crossfade region
+            new_audio = s[xfade_n:] if n_samps > xfade_n else s
         else:
-            self._pending_tail_model = None
-            self._pending_tail_target_len = 0
+            # Short chunk or no crossfade: use entire chunk
+            new_audio = s
+            
+        if new_audio.shape[0] > 0:
+            target_audio = to_target(new_audio)
+            if target_audio.shape[0] > 0:
+                print(f"[append] body len={target_audio.shape[0]} rms={_dbg_rms_dbfs(target_audio):+.1f} dBFS")
+                self._spool = np.concatenate([self._spool, target_audio], axis=0) if self._spool.size else target_audio
+                self._spool_written += target_audio.shape[0]
 
+        # --- HEALTH MONITORING ---
+        
+        if not is_healthy:
+            if self._silence_streak >= 3:  # After 3 silent chunks, try to recover
+                self._recover_from_silence()
+        else:
+            # Save current context as "good" backup
+            if hasattr(self.state, 'context_tokens') and self.state.context_tokens is not None:
+                self._last_good_context_tokens = np.copy(self.state.context_tokens)
 
+        # Trim model stream to reasonable length (keep ~30 seconds)
+        max_model_samples = int(30.0 * self._model_sr)
+        if self._model_stream.shape[0] > max_model_samples:
+            self._model_stream = self._model_stream[-max_model_samples:]
 
     def _should_generate_next_chunk(self) -> bool:
         # Allow running ahead relative to whichever is larger: last *consumed*
@@ -613,6 +549,7 @@ class JamWorker(threading.Thread):
                 "guidance_weight": float(self.params.guidance_weight),
                 "temperature": float(self.params.temperature),
                 "topk": int(self.params.topk),
+                "silence_streak": self._silence_streak,  # Add health info
             }
             chunk = JamChunk(index=self.idx, audio_base64=audio_b64, metadata=meta)
 
@@ -637,6 +574,7 @@ class JamWorker(threading.Thread):
                         # inplace update (no reset)
                         self.state.context_tokens = spliced
                         self._pending_token_splice = None
+                        print("[reseed] Token splice applied")
                     except Exception:
                         # fallback: full reseed using spliced tokens
                         new_state = self.mrt.init_state()
@@ -644,6 +582,7 @@ class JamWorker(threading.Thread):
                         self.state = new_state
                         self._model_stream = None
                         self._pending_token_splice = None
+                        print("[reseed] Token splice fallback to full reset")
                 elif self._pending_reseed is not None:
                     ctx = self._coerce_tokens(self._pending_reseed["ctx"])
                     new_state = self.mrt.init_state()
@@ -651,6 +590,7 @@ class JamWorker(threading.Thread):
                     self.state = new_state
                     self._model_stream = None
                     self._pending_reseed = None
+                    print("[reseed] Full reseed applied")
 
     # ---------- main loop ----------
 
@@ -687,9 +627,10 @@ class JamWorker(threading.Thread):
             self._emit_ready()
 
         # finalize resampler (flush) — not strictly necessary here
-        tail = self._rs.process(np.zeros((0,2), np.float32), final=True)
-        if tail.size:
-            self._spool = np.concatenate([self._spool, tail], axis=0)
-            self._spool_written += tail.shape[0]
+        if self._rs is not None:
+            tail = self._rs.process(np.zeros((0,2), np.float32), final=True)
+            if tail.size:
+                self._spool = np.concatenate([self._spool, tail], axis=0)
+                self._spool_written += tail.shape[0]
         # one last emit attempt
         self._emit_ready()
