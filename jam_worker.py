@@ -445,24 +445,52 @@ class JamWorker(threading.Thread):
 
     def _append_model_chunk_and_spool(self, wav: au.Waveform) -> None:
         """
-        Conservative boundary fix:
-        - Emit body+tail immediately (target SR), unchanged from your original behavior.
-        - On *next* call, compute the mixed overlap (prev tail ⨉ cos + new head ⨉ sin),
-        resample it, and overwrite the last `_pending_tail_target_len` samples in the
-        target-SR spool with that mixed overlap. Then emit THIS chunk's body+tail and
-        remember THIS chunk's tail length at target SR for the next correction.
+        Append one MagentaRT chunk into the target-SR spool with an energy-aware,
+        deferred-overwrite crossfade to avoid writing near-silence at bar edges.
 
-        This keeps external timing and bar alignment identical, but removes the audible
-        fade-to-zero at chunk ends.
+        Key behavior:
+        - Append BODY and TAIL of *this* chunk right away (resampled to target SR).
+        - Keep THIS chunk's model-rate TAIL (+ its target-SR length if appended) to repair the
+        previous boundary on the *next* call by mixing (prev_tail*cos + new_head*sin).
+        - When the correction length Lpop would be 0 (e.g., tail produced no target samples last time),
+        we APPEND the mixed-overlap to bridge the gap instead of overwriting 0 samples.
+        - Before overwriting/appending the mixed-overlap, we guard against writing ultra-quiet audio
+        by normalizing it up (bounded) if it's >20 dB below the existing spool end.
+
+        This keeps your bar clock and external timing the same, but removes "bad starts" and fizzles.
         """
+        import math
+        import numpy as np
+
+        # ---- helpers ----
+        def _rms_dbfs(x: np.ndarray) -> float:
+            if x.size == 0:
+                return -120.0
+            if x.ndim == 2 and x.shape[1] > 1:
+                x_m = x.mean(axis=1, dtype=np.float32)
+            else:
+                x_m = x.astype(np.float32, copy=False).reshape(-1)
+            # guard for NaNs
+            x_m = np.nan_to_num(x_m, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            r = float(np.sqrt(np.mean(x_m * x_m) + 1e-12))
+            return 20.0 * math.log10(max(r, 1e-12))
+
+        def _rms_dbfs_model(x: np.ndarray) -> float:
+            # same metric; named for clarity in logs
+            return _rms_dbfs(x)
+
+        def to_target(y: np.ndarray) -> np.ndarray:
+            return y if self._rs is None else self._rs.process(y, final=False)
 
         # ---- unpack model-rate samples ----
         s = wav.samples.astype(np.float32, copy=False)
         if s.ndim == 1:
             s = s[:, None]
-        n_samps, _ = s.shape
-        if n_samps == 0:
-            return
+        if s.shape[1] == 1:
+            # ensure stereo shape for consistency with your spool (S,2)
+            s = np.repeat(s, 2, axis=1)
+
+        n_samps = int(s.shape[0])
 
         # crossfade length in model samples
         try:
@@ -471,110 +499,114 @@ class JamWorker(threading.Thread):
             xfade_s = 0.0
         xfade_n = int(round(max(0.0, xfade_s) * float(self._model_sr)))
 
-        # helper: resample to target SR via your streaming resampler
-        def to_target(y: np.ndarray) -> np.ndarray:
-            return y if self._rs is None else self._rs.process(y, final=False)
-
-        # ------------------------------------------
-        # (A) If we have a pending model tail, fix the last emitted tail at target SR
-        # ------------------------------------------
-        if self._pending_tail_model is not None and self._pending_tail_model.shape[0] == xfade_n and xfade_n > 0 and n_samps >= xfade_n:
-            head = s[:xfade_n, :]
-
-            print(f"[model] head    len={head.shape[0]} rms={_dbg_rms_dbfs_model(head):+.1f} dBFS")
-
-            t = np.linspace(0.0, np.pi/2.0, xfade_n, endpoint=False, dtype=np.float32)[:, None]
-            cosw = np.cos(t, dtype=np.float32)
-            sinw = np.sin(t, dtype=np.float32)
-            mixed_model = (self._pending_tail_model * cosw) + (head * sinw)  # [xfade_n, C] at model SR
-
-            y_mixed = to_target(mixed_model.astype(np.float32))
-            Lcorr = int(y_mixed.shape[0])  # exact target-SR samples to write
-
-            # DEBUG: corrected overlap RMS (what we intend to hear at the boundary)
-            if y_mixed.size:
-                print(f"[append] mixedOverlap len={y_mixed.shape[0]} rms={_dbg_rms_dbfs(y_mixed):+.1f} dBFS")
-
-            # Overwrite the last `_pending_tail_target_len` samples of the spool with `y_mixed`.
-            # Use the *smaller* of the two lengths to be safe.
-            Lpop = min(self._pending_tail_target_len, self._spool.shape[0], Lcorr)
-            if Lpop > 0 and self._spool.size:
-                # Trim last Lpop samples
-                self._spool = self._spool[:-Lpop, :]
-                self._spool_written -= Lpop
-                # Append corrected overlap (trim/pad to Lpop to avoid drift)
-                if Lcorr != Lpop:
-                    if Lcorr > Lpop:
-                        y_m = y_mixed[-Lpop:, :]
-                    else:
-                        pad = np.zeros((Lpop - Lcorr, y_mixed.shape[1]), dtype=np.float32)
-                        y_m = np.concatenate([y_mixed, pad], axis=0)
-                else:
-                    y_m = y_mixed
-                self._spool = np.concatenate([self._spool, y_m], axis=0) if self._spool.size else y_m
-                self._spool_written += y_m.shape[0]
-
-            # For internal continuity, update _model_stream like before
-            if self._model_stream is None or self._model_stream.shape[0] < xfade_n:
-                self._model_stream = s[xfade_n:].copy()
-            else:
-                self._model_stream = np.concatenate([self._model_stream[:-xfade_n], mixed_model, s[xfade_n:]], axis=0)
-        else:
-            # First-ever call or too-short to mix: maintain _model_stream minimally
-            if xfade_n > 0 and n_samps > xfade_n:
-                self._model_stream = s[xfade_n:].copy() if self._model_stream is None else np.concatenate([self._model_stream, s[xfade_n:]], axis=0)
-            else:
-                self._model_stream = s.copy() if self._model_stream is None else np.concatenate([self._model_stream, s], axis=0)
-
-        # ------------------------------------------
-        # (B) Emit THIS chunk's body and tail (same external behavior)
-        # ------------------------------------------
+        # carve head/body/tail in model domain
         if xfade_n > 0 and n_samps >= (2 * xfade_n):
-            body = s[xfade_n:-xfade_n, :]
-            print(f"[model] body    len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
-            if body.size:
-                y_body = to_target(body.astype(np.float32))
-                if y_body.size:
-                    # DEBUG: body RMS we are actually appending
-                    print(f"[append] body len={y_body.shape[0]} rms={_dbg_rms_dbfs(y_body):+.1f} dBFS")
-                    self._spool = np.concatenate([self._spool, y_body], axis=0) if self._spool.size else y_body
-                    self._spool_written += y_body.shape[0]
+            head_m = s[:xfade_n, :]
+            body_m = s[xfade_n:n_samps - xfade_n, :]
+            tail_m = s[n_samps - xfade_n:, :]
         else:
-            # If chunk too short for head+tail split, treat all (minus preroll) as body
-            if xfade_n > 0 and n_samps > xfade_n:
-                body = s[xfade_n:, :]
-                print(f"[model] body(S) len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
-                y_body = to_target(body.astype(np.float32))
-                if y_body.size:
-                    # DEBUG: body RMS in short-chunk path
-                    print(f"[append] body(len=short) len={y_body.shape[0]} rms={_dbg_rms_dbfs(y_body):+.1f} dBFS")
-                    self._spool = np.concatenate([self._spool, y_body], axis=0) if self._spool.size else y_body
-                    self._spool_written += y_body.shape[0]
-                # No tail to remember this round
-                self._pending_tail_model = None
-                self._pending_tail_target_len = 0
-                return
+            # too short or no xfade configured — treat everything as body
+            head_m = np.zeros((0, 2), dtype=np.float32)
+            body_m = s
+            tail_m = np.zeros((0, 2), dtype=np.float32)
 
-        # Tail (always remember how many TARGET samples we append)
-        if xfade_n > 0 and n_samps >= xfade_n:
-            tail = s[-xfade_n:, :]
-            print(f"[model] tail    len={tail.shape[0]} rms={_dbg_rms_dbfs_model(tail):+.1f} dBFS")
-            y_tail = to_target(tail.astype(np.float32))
-            Ltail = int(y_tail.shape[0])
-            if Ltail:
-                # DEBUG: tail RMS we are appending now (to be corrected next call)
-                print(f"[append] tail len={y_tail.shape[0]} rms={_dbg_rms_dbfs(y_tail):+.1f} dBFS")
-                self._spool = np.concatenate([self._spool, y_tail], axis=0) if self._spool.size else y_tail
-                self._spool_written += Ltail
-                self._pending_tail_model = tail.copy()
-                self._pending_tail_target_len = Ltail
-            else:
-                # Nothing appended (resampler returned nothing yet) — keep model tail but mark zero target len
-                self._pending_tail_model = tail.copy()
-                self._pending_tail_target_len = 0
-        else:
+        # ------------------------------------------
+        # (A) Repair the PREVIOUS boundary if we have a pending model-tail
+        # ------------------------------------------
+        did_boundary_mix = False
+        if (self._pending_tail_model is not None) and (xfade_n > 0) and (n_samps >= xfade_n):
+            # adaptive crossfade length when either side is very quiet
+            tail_prev_m = self._pending_tail_model
+            head_now_m  = head_m
+
+            # safety: match shapes
+            if tail_prev_m.shape[1] != 2:
+                if tail_prev_m.ndim == 1:
+                    tail_prev_m = tail_prev_m[:, None]
+                tail_prev_m = np.repeat(tail_prev_m[:, :1], 2, axis=1)
+            if head_now_m.shape[1] != 2:
+                if head_now_m.ndim == 1:
+                    head_now_m = head_now_m[:, None]
+                head_now_m = np.repeat(head_now_m[:, :1], 2, axis=1)
+
+            # compute energy to decide whether to shorten xfade
+            tail_r = _rms_dbfs_model(tail_prev_m)
+            head_r = _rms_dbfs_model(head_now_m)
+            xfade_use = int(xfade_n)
+            if min(tail_r, head_r) < -45.0:
+                xfade_use = max(1, xfade_n // 4)
+
+            # windowed overlap (model domain)
+            Lm = min(xfade_use, tail_prev_m.shape[0], head_now_m.shape[0])
+            if Lm > 0:
+                t = np.linspace(0.0, math.pi / 2.0, Lm, endpoint=False, dtype=np.float32)[:, None]
+                cosw = np.cos(t, dtype=np.float32)
+                sinw = np.sin(t, dtype=np.float32)
+                mixed_m = tail_prev_m[-Lm:, :] * cosw + head_now_m[:Lm, :] * sinw
+
+                # resample to target and correct the end of the spool
+                y_mixed = to_target(mixed_m)
+                Lcorr = int(y_mixed.shape[0])
+
+                if Lcorr > 0:
+                    # how many samples from last time's tail did we append?
+                    # (may be zero if resampler yielded nothing then)
+                    Lpop = int(min(self._pending_tail_target_len, self._spool.shape[0], Lcorr))
+
+                    if Lpop > 0:
+                        # energy-aware overwrite of last Lpop samples
+                        prev_end = self._spool[-Lpop:, :]
+                        new_seg  = y_mixed[-Lpop:, :]
+
+                        prev_r = _rms_dbfs(prev_end)
+                        new_r  = _rms_dbfs(new_seg)
+
+                        # If the new overlap is >20 dB quieter than what's there, lift it (bounded)
+                        if new_r < (prev_r - 20.0):
+                            lift_db = max(0.0, min(20.0, (prev_r - 6.0) - new_r))  # cap boost; leave ~6 dB headroom
+                            scale   = 10.0 ** (lift_db / 20.0)
+                            new_seg = np.clip(new_seg * scale, -1.0, 1.0).astype(np.float32, copy=False)
+
+                        self._spool[-Lpop:, :] = new_seg
+                        print(f"[append] mixedOverlap len={Lpop} rms={_rms_dbfs(new_seg):+.1f} dBFS")
+                    else:
+                        # Nothing to overwrite (e.g., last tail produced 0 target samples).
+                        # Bridge by APPENDING the mixed-overlap.
+                        self._spool = np.concatenate([self._spool, y_mixed], axis=0)
+                        self._spool_written += int(y_mixed.shape[0])
+                        print(f"[append] mixedOverlap len={y_mixed.shape[0]} rms={_rms_dbfs(y_mixed):+.1f} dBFS")
+
+                    did_boundary_mix = True
+
+            # clear pending once we attempted the repair
             self._pending_tail_model = None
             self._pending_tail_target_len = 0
+
+        # ------------------------------------------
+        # (B) Append this chunk's BODY then TAIL (target SR)
+        # ------------------------------------------
+        # BODY
+        y_body = to_target(body_m) if body_m.size else np.zeros((0, 2), dtype=np.float32)
+        if y_body.size:
+            self._spool = np.concatenate([self._spool, y_body], axis=0)
+            self._spool_written += int(y_body.shape[0])
+        print(f"[append] body len={y_body.shape[0] if y_body.size else 0} rms={_rms_dbfs(y_body):+.1f} dBFS")
+
+        # TAIL (we append now to keep continuity; on next call we'll correct the end)
+        y_tail = to_target(tail_m) if tail_m.size else np.zeros((0, 2), dtype=np.float32)
+        if y_tail.size:
+            self._spool = np.concatenate([self._spool, y_tail], axis=0)
+            self._spool_written += int(y_tail.shape[0])
+            self._pending_tail_target_len = int(y_tail.shape[0])   # how much we just added at target SR
+        else:
+            # resampler returned nothing for the tail; mark 0 so next Lpop==0
+            self._pending_tail_target_len = 0
+        print(f"[append] tail len={y_tail.shape[0] if y_tail.size else 0} rms={_rms_dbfs(y_tail):+.1f} dBFS")
+
+        # keep THIS chunk's model tail to mix with next chunk's head
+        # (even if y_tail had 0 target samples; in that case we'll bridge by appending mixed overlap)
+        self._pending_tail_model = tail_m if tail_m.size else None
+
 
 
 
