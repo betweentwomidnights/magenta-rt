@@ -413,13 +413,13 @@ class JamWorker(threading.Thread):
 
     def _append_model_chunk_and_spool(self, wav: au.Waveform) -> None:
         """
-        REWRITTEN: Robust audio processing with silence detection and health monitoring.
+        REWRITTEN: Robust audio processing that rejects silent chunks entirely.
         
         Strategy:
         1. Validate input chunk for silence/issues
-        2. Use simpler crossfading that handles silence gracefully  
-        3. Update model stream with health checks
-        4. Convert to target SR and append to spool
+        2. REJECT silent chunks - don't add them to spool or model stream
+        3. Use healthy crossfading only between good audio
+        4. Aggressive recovery when silence detected
         """
         # Unpack model-rate samples
         s = wav.samples.astype(np.float32, copy=False)
@@ -429,8 +429,9 @@ class JamWorker(threading.Thread):
         if n_samps == 0:
             return
 
-        # Health check on new chunk
+        # Health check on new chunk - use stricter threshold
         is_healthy = self._check_model_health(s)
+        is_very_quiet = _is_silent(s, threshold_db=-50.0)  # stricter than default -60
         
         # Get crossfade params
         try:
@@ -439,13 +440,29 @@ class JamWorker(threading.Thread):
             xfade_s = 0.0
         xfade_n = int(round(max(0.0, xfade_s) * float(self._model_sr)))
 
-        print(f"[model] chunk len={n_samps} rms={_dbg_rms_dbfs_model(s):+.1f} dBFS healthy={is_healthy}")
+        print(f"[model] chunk len={n_samps} rms={_dbg_rms_dbfs_model(s):+.1f} dBFS healthy={is_healthy} quiet={is_very_quiet}")
+
+        # --- REJECT PROBLEMATIC CHUNKS ---
+        if not is_healthy or is_very_quiet:
+            print(f"[REJECT] Discarding unhealthy/quiet chunk - not adding to spool or model stream")
+            
+            # Trigger recovery immediately on first bad chunk
+            if self._silence_streak >= 1:
+                self._recover_from_silence()
+                
+            # Don't process this chunk at all - return early
+            return
+
+        # Reset silence streak on good chunk
+        if self._silence_streak > 0:
+            print(f"✅ Audio resumed after {self._silence_streak} rejected chunks")
+        self._silence_streak = 0
 
         # Helper: resample to target SR
         def to_target(y: np.ndarray) -> np.ndarray:
             return y if self._rs is None else self._rs.process(y, final=False)
 
-        # --- SIMPLIFIED CROSSFADE LOGIC ---
+        # --- SIMPLIFIED CROSSFADE LOGIC (only for healthy audio) ---
         
         if self._model_stream is None:
             # First chunk - no crossfading needed
@@ -455,13 +472,14 @@ class JamWorker(threading.Thread):
             # No crossfade configured or chunk too short - simple append
             self._model_stream = np.concatenate([self._model_stream, s], axis=0)
             
-        elif _is_silent(self._model_stream[-xfade_n:]) or _is_silent(s[:xfade_n]):
-            # One side is silent - don't crossfade, just append
-            print(f"[crossfade] Skipping crossfade due to silence")
-            self._model_stream = np.concatenate([self._model_stream, s], axis=0)
+        elif _is_silent(self._model_stream[-xfade_n:], threshold_db=-50.0):
+            # Previous tail is quiet - don't crossfade, just replace
+            print(f"[crossfade] Replacing quiet tail with new audio")
+            # Remove quiet tail and append new chunk
+            self._model_stream = np.concatenate([self._model_stream[:-xfade_n], s], axis=0)
             
         else:
-            # Normal crossfade between non-silent audio
+            # Normal crossfade between healthy audio
             tail = self._model_stream[-xfade_n:]
             head = s[:xfade_n]
             body = s[xfade_n:] if n_samps > xfade_n else np.zeros((0, s.shape[1]), dtype=np.float32)
@@ -482,9 +500,9 @@ class JamWorker(threading.Thread):
                 body
             ], axis=0)
 
-        # --- CONVERT AND APPEND TO SPOOL ---
+        # --- CONVERT AND APPEND TO SPOOL (only healthy audio reaches here) ---
         
-        # Take the new audio from this iteration (avoid reprocessing old audio)
+        # Take the new audio from this iteration
         if xfade_n > 0 and n_samps >= xfade_n:
             # Normal case: body after crossfade region
             new_audio = s[xfade_n:] if n_samps > xfade_n else s
@@ -499,15 +517,10 @@ class JamWorker(threading.Thread):
                 self._spool = np.concatenate([self._spool, target_audio], axis=0) if self._spool.size else target_audio
                 self._spool_written += target_audio.shape[0]
 
-        # --- HEALTH MONITORING ---
-        
-        if not is_healthy:
-            if self._silence_streak >= 3:  # After 3 silent chunks, try to recover
-                self._recover_from_silence()
-        else:
-            # Save current context as "good" backup
-            if hasattr(self.state, 'context_tokens') and self.state.context_tokens is not None:
-                self._last_good_context_tokens = np.copy(self.state.context_tokens)
+        # --- SAVE GOOD CONTEXT ---
+        # Only save context from healthy chunks
+        if hasattr(self.state, 'context_tokens') and self.state.context_tokens is not None:
+            self._last_good_context_tokens = np.copy(self.state.context_tokens)
 
         # Trim model stream to reasonable length (keep ~30 seconds)
         max_model_samples = int(30.0 * self._model_sr)
