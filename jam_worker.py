@@ -26,6 +26,17 @@ def _dbg_rms_dbfs(x: np.ndarray) -> float:
     r = float(np.sqrt(np.mean(x * x) + 1e-12))
     return 20.0 * np.log10(max(r, 1e-12))
 
+def _dbg_rms_dbfs_model(x: np.ndarray) -> float:
+    # x is model-rate, shape [S,C] or [S]
+    
+    if x.ndim == 2:
+        x = x.mean(axis=1)
+    r = float(np.sqrt(np.mean(x * x) + 1e-12))
+    return 20.0 * np.log10(max(r, 1e-12))
+
+def _dbg_shape(x):
+    return tuple(x.shape) if hasattr(x, "shape") else ("-",)
+
 # -----------------------------
 # Data classes
 # -----------------------------
@@ -469,6 +480,9 @@ class JamWorker(threading.Thread):
         # ------------------------------------------
         if self._pending_tail_model is not None and self._pending_tail_model.shape[0] == xfade_n and xfade_n > 0 and n_samps >= xfade_n:
             head = s[:xfade_n, :]
+
+            print(f"[model] head    len={head.shape[0]} rms={_dbg_rms_dbfs_model(head):+.1f} dBFS")
+
             t = np.linspace(0.0, np.pi/2.0, xfade_n, endpoint=False, dtype=np.float32)[:, None]
             cosw = np.cos(t, dtype=np.float32)
             sinw = np.sin(t, dtype=np.float32)
@@ -517,6 +531,7 @@ class JamWorker(threading.Thread):
         # ------------------------------------------
         if xfade_n > 0 and n_samps >= (2 * xfade_n):
             body = s[xfade_n:-xfade_n, :]
+            print(f"[model] body    len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
             if body.size:
                 y_body = to_target(body.astype(np.float32))
                 if y_body.size:
@@ -528,6 +543,7 @@ class JamWorker(threading.Thread):
             # If chunk too short for head+tail split, treat all (minus preroll) as body
             if xfade_n > 0 and n_samps > xfade_n:
                 body = s[xfade_n:, :]
+                print(f"[model] body(S) len={body.shape[0]} rms={_dbg_rms_dbfs_model(body):+.1f} dBFS")
                 y_body = to_target(body.astype(np.float32))
                 if y_body.size:
                     # DEBUG: body RMS in short-chunk path
@@ -542,6 +558,7 @@ class JamWorker(threading.Thread):
         # Tail (always remember how many TARGET samples we append)
         if xfade_n > 0 and n_samps >= xfade_n:
             tail = s[-xfade_n:, :]
+            print(f"[model] tail    len={tail.shape[0]} rms={_dbg_rms_dbfs_model(tail):+.1f} dBFS")
             y_tail = to_target(tail.astype(np.float32))
             Ltail = int(y_tail.shape[0])
             if Ltail:
