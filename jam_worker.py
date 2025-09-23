@@ -1,6 +1,8 @@
 # jam_worker.py - Bar-locked spool rewrite
 from __future__ import annotations
 
+import os
+
 import threading, time
 from dataclasses import dataclass
 from fractions import Fraction
@@ -435,7 +437,7 @@ class JamWorker(threading.Thread):
         This keeps external timing and bar alignment identical, but removes the audible
         fade-to-zero at chunk ends.
         """
-        import numpy as np
+        
 
         # ---- unpack model-rate samples ----
         s = wav.samples.astype(np.float32, copy=False)
@@ -550,20 +552,77 @@ class JamWorker(threading.Thread):
         return self.idx <= (horizon_anchor + self._max_buffer_ahead)
 
     def _emit_ready(self):
-        """Emit next chunk(s) if the spool has enough samples."""
+        """Emit next chunk(s) if the spool has enough samples. With verbose RMS debug."""
+        
+
+        QDB_SILENCE = -55.0  # quarter-bar segment considered "near silence" if RMS dBFS below this
+        EPS = 1e-12
+
+        def rms_dbfs(x: np.ndarray) -> float:
+            # x: float32 [-1,1]; return single-channel RMS dBFS (mean over channels if stereo)
+            if x.ndim == 2:
+                x = x.mean(axis=1)
+            rms = float(np.sqrt(np.mean(np.square(x)) + EPS))
+            return 20.0 * np.log10(max(rms, EPS))
+
+        def qbar_rms_dbfs(x: np.ndarray, seg_len: int) -> list[float]:
+            vals = []
+            if x.ndim == 2:
+                mono = x.mean(axis=1)
+            else:
+                mono = x
+            N = mono.shape[0]
+            for i in range(0, N, seg_len):
+                seg = mono[i:min(i + seg_len, N)]
+                if seg.size == 0:
+                    break
+                r = float(np.sqrt(np.mean(seg * seg) + EPS))
+                vals.append(20.0 * np.log10(max(r, EPS)))
+            return vals
+
         while True:
             start, end = self._bar_clock.bounds_for_chunk(self.idx, self.params.bars_per_chunk)
             if end > self._spool_written:
-                break  # need more audio
-            loop = self._spool[start:end]
+                # Not enough audio buffered for the next full chunk
+                # Debug the readiness gap once per idx
+                # print(f"[emit idx={self.idx}] need end={end}, have={self._spool_written} (Δ={end - self._spool_written})")
+                break
+
+            # Slice the emitted window (target SR)
+            loop = self._spool[start:end]  # shape: [samples, channels] @ target_sr
+
+            # ---- DEBUG: pre-loudness quarter-bar RMS ----
+            spb = self._bar_clock.bar_samps                     # samples per bar @ target_sr
+            qlen = max(1, spb // 4)                             # quarter-bar segment length
+            q_rms_pre = qbar_rms_dbfs(loop, qlen)
+            # Mark segments that look like near-silence
+            silent_marks_pre = ["🟢" if v > QDB_SILENCE else "🟥" for v in q_rms_pre[:8]]
+            print(f"[emit idx={self.idx}] pre-LM qRMS dBFS: {['%5.1f'%v for v in q_rms_pre[:8]]} {''.join(silent_marks_pre)}")
 
             # Loudness match to reference loop (optional)
+            gain_db_applied = None
             if self.params.ref_loop is not None and self.params.loudness_mode != "none":
                 ref = self.params.ref_loop.as_stereo().resample(self.params.target_sr)
                 wav = au.Waveform(loop.copy(), int(self.params.target_sr))
-                matched, _ = match_loudness_to_reference(ref, wav, method=self.params.loudness_mode, headroom_db=self.params.headroom_db)
-                loop = matched.samples
+                try:
+                    matched, gain_db_applied = match_loudness_to_reference(
+                        ref, wav,
+                        method=self.params.loudness_mode,
+                        headroom_db=self.params.headroom_db
+                    )
+                    loop = matched.samples
+                except Exception as e:
+                    print(f"[emit idx={self.idx}] loudness-match ERROR: {e}; proceeding with un-matched audio")
 
+            # ---- DEBUG: post-loudness quarter-bar RMS ----
+            q_rms_post = qbar_rms_dbfs(loop, qlen)
+            silent_marks_post = ["🟢" if v > QDB_SILENCE else "🟥" for v in q_rms_post[:8]]
+            if gain_db_applied is None:
+                print(f"[emit idx={self.idx}] post-LM qRMS dBFS: {['%5.1f'%v for v in q_rms_post[:8]]} {''.join(silent_marks_post)} (LM: none)")
+            else:
+                print(f"[emit idx={self.idx}] post-LM qRMS dBFS: {['%5.1f'%v for v in q_rms_post[:8]]} {''.join(silent_marks_post)} (LM gain {gain_db_applied:+.2f} dB)")
+
+            # Encode & ship
             audio_b64, total_samples, channels = wav_bytes_base64(loop, int(self.params.target_sr))
             meta = {
                 "bpm": float(self.params.bpm),
@@ -580,27 +639,31 @@ class JamWorker(threading.Thread):
             }
             chunk = JamChunk(index=self.idx, audio_base64=audio_b64, metadata=meta)
 
+            # Emit to outbox
             with self._cv:
                 self._outbox[self.idx] = chunk
                 self._cv.notify_all()
+
+            # ---- DEBUG: boundary bookkeeping ----
+            print(f"[emit idx={self.idx}] slice [{start}:{end}] (len={end-start}), spool_written={self._spool_written}")
+
             self.idx += 1
 
             # If a reseed is queued, install it *right after* we finish a chunk
             with self._lock:
-                # Prefer seamless token splice when available
                 if self._pending_token_splice is not None:
                     spliced = self._coerce_tokens(self._pending_token_splice["tokens"])
                     try:
-                        # inplace update (no reset)
-                        self.state.context_tokens = spliced
+                        self.state.context_tokens = spliced   # in-place update
                         self._pending_token_splice = None
+                        print(f"[emit idx={self.idx}] installed token splice (in-place)")
                     except Exception:
-                        # fallback: full reseed using spliced tokens
                         new_state = self.mrt.init_state()
                         new_state.context_tokens = spliced
                         self.state = new_state
                         self._model_stream = None
                         self._pending_token_splice = None
+                        print(f"[emit idx={self.idx}] installed token splice (reinit state)")
                 elif self._pending_reseed is not None:
                     ctx = self._coerce_tokens(self._pending_reseed["ctx"])
                     new_state = self.mrt.init_state()
@@ -608,6 +671,7 @@ class JamWorker(threading.Thread):
                     self.state = new_state
                     self._model_stream = None
                     self._pending_reseed = None
+                    print(f"[emit idx={self.idx}] performed full reseed")
 
     # ---------- main loop ----------
 
