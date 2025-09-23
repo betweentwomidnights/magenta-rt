@@ -36,7 +36,6 @@ class JamParams:
     temperature: float = 1.1
     topk: int = 40
     style_ramp_seconds: float = 8.0  # 0 => instant (current behavior), try 6.0–10.0 for gentle glides
-    prime_steps: int = 1 
 
 
 @dataclass
@@ -534,21 +533,7 @@ class JamWorker(threading.Thread):
     # ---------- main loop ----------
 
     def run(self):
-        # --- PRIME (optional) ---
-        n_prime = max(0, int(getattr(self.params, "prime_steps", 0) or 0))
-        if n_prime:
-            with self._lock:
-                target = self.params.style_vec
-                if target is not None:
-                    # initialize or nudge _style_vec exactly once before prime
-                    self._style_vec = np.array(target, dtype=np.float32, copy=True)
-                style_to_use = self._style_vec
-
-            for _ in range(n_prime):
-                _wav, self.state = self.mrt.generate_chunk(state=self.state, style=style_to_use)
-                # discard audio; just advance state
-
-        
+        # generate until stopped
         while not self._stop_event.is_set():
             # throttle generation if we are far ahead
             if not self._should_generate_next_chunk():
