@@ -117,9 +117,6 @@ class JamWorker(threading.Thread):
         self._spool = np.zeros((0, 2), dtype=np.float32)   # (S,2) target SR
         self._spool_written = 0                            # absolute frames written into spool
 
-        self._pending_tail_model = None  # type: Optional[np.ndarray]
-
-
         # bar clock: start with offset 0; if you have a downbeat estimator, set base later
         self._bar_clock = BarClock(self.params.target_sr, self.params.bpm, self.params.beats_per_bar, base_offset_samples=0)
 
@@ -423,103 +420,48 @@ class JamWorker(threading.Thread):
 
     # ---------- core streaming helpers ----------
 
-    def _append_model_chunk_and_spool(self, wav: au.Waveform) -> None:
-        """
-        Option B: overwrite the last emitted tail (at target SR) with a properly mixed
-        overlap once the next head arrives. Then emit the new body+tail as usual.
-
-        Keeps the externally visible timing identical to the original pipeline while fixing
-        the audible boundary.
-        """
-        import numpy as np
-
-        # ---------- unpack model-rate samples ----------
+    def _append_model_chunk_and_spool(self, wav: au.Waveform):
+        """Crossfade into the model-rate stream and write the *non-overlapped*
+        tail to the target-SR spool."""
         s = wav.samples.astype(np.float32, copy=False)
         if s.ndim == 1:
             s = s[:, None]
-        n_samps, n_ch = s.shape
+        sr = self._model_sr
+        xfade_s = float(self.mrt.config.crossfade_length)
+        xfade_n = int(round(max(0.0, xfade_s) * sr))
 
-        sr_model = self._model_sr
-        sr_targ = int(self.params.target_sr)
-
-        # crossfade length (seconds -> model samples)
-        try:
-            xfade_s = float(self.mrt.config.crossfade_length)
-        except Exception:
-            xfade_s = 0.0
-        xfade_n = int(round(max(0.0, xfade_s) * float(sr_model)))
-
-        # helper: resample model-rate frames to target SR using your existing resampler
-        def _rs_to_target(y: np.ndarray) -> np.ndarray:
-            return y if self._rs is None else self._rs.process(y, final=False)
-
-        # trivial cases
-        if n_samps == 0:
-            return
-        if xfade_n <= 0 or n_samps < (xfade_n + 1):
-            # No crossfade or too short to hold a head
-            y_all = _rs_to_target(s)
-            if y_all.size:
-                self._spool = np.concatenate([self._spool, y_all], axis=0) if self._spool.size else y_all
-                self._spool_written += y_all.shape[0]
-            # keep model stream contiguous for internal consumers
-            self._model_stream = s if self._model_stream is None else np.concatenate([self._model_stream, s], axis=0)
+        if self._model_stream is None:
+            # first chunk: drop the preroll (xfade) then spool
+            new_part = s[xfade_n:] if xfade_n < s.shape[0] else s[:0]
+            self._model_stream = new_part.copy()
+            if new_part.size:
+                y = (new_part.astype(np.float32, copy=False)
+                     if self._rs is None else
+                     self._rs.process(new_part.astype(np.float32, copy=False), final=False))
+                self._spool = np.concatenate([self._spool, y], axis=0)
+                self._spool_written += y.shape[0]
             return
 
-        # ---------- split current chunk at model rate ----------
-        head = s[:xfade_n, :]
-        body = s[xfade_n:-xfade_n, :] if n_samps >= (2 * xfade_n) else None
-        tail = s[-xfade_n:, :]
-
-        # ----- (A) If we had a pending model tail, correct the spool by replacing its target-rate tail with a mixed overlap -----
-        if getattr(self, "_pending_tail_model", None) is not None and self._pending_tail_model.shape[0] == xfade_n:
-            prev_tail = self._pending_tail_model
-
-            # equal-power mix at model rate
-            t = np.linspace(0.0, np.pi / 2.0, xfade_n, endpoint=False, dtype=np.float32)[:, None]
-            cosw = np.cos(t, dtype=np.float32)
-            sinw = np.sin(t, dtype=np.float32)
-            mixed_model = (prev_tail * cosw) + (head * sinw)        # [xfade_n, C]
-
-            # resample the MIXED overlap to target SR
-            y_mixed = _rs_to_target(mixed_model.astype(np.float32))
-
-            # compute 'target_xfade_n' as the length of y_mixed (robust to resampler latency)
-            target_xfade_n = int(y_mixed.shape[0])
-
-            # pop last target_xfade_n samples from the spool (they currently hold the old tail)
-            if target_xfade_n > 0 and self._spool.size and self._spool.shape[0] >= target_xfade_n:
-                self._spool = self._spool[:-target_xfade_n, :]
-                self._spool_written -= target_xfade_n
-
-            # append the corrected mixed overlap
-            if y_mixed.size:
-                self._spool = np.concatenate([self._spool, y_mixed], axis=0) if self._spool.size else y_mixed
-                self._spool_written += y_mixed.shape[0]
-
-        # ----- (B) Emit this chunk's body and tail at target SR (same as the original behavior) -----
-        if body is not None and body.size:
-            y_body = _rs_to_target(body.astype(np.float32))
-            if y_body.size:
-                self._spool = np.concatenate([self._spool, y_body], axis=0) if self._spool.size else y_body
-                self._spool_written += y_body.shape[0]
-
-        y_tail = _rs_to_target(tail.astype(np.float32))
-        if y_tail.size:
-            self._spool = np.concatenate([self._spool, y_tail], axis=0) if self._spool.size else y_tail
-            self._spool_written += y_tail.shape[0]
-
-        # ----- (C) Maintain model-stream continuity like before -----
-        # (Drop the model preroll on the very first append; otherwise splice with mixed + new content.)
-        if self._model_stream is None or self._model_stream.shape[0] < xfade_n:
-            new_part_for_stream = s[xfade_n:] if xfade_n < n_samps else s[:0]
-            self._model_stream = new_part_for_stream.copy()
+        # crossfade into existing stream
+        if xfade_n > 0 and self._model_stream.shape[0] >= xfade_n and s.shape[0] >= xfade_n:
+            tail = self._model_stream[-xfade_n:]
+            head = s[:xfade_n]
+            t = np.linspace(0, np.pi/2, xfade_n, endpoint=False, dtype=np.float32)[:, None]
+            mixed = tail * np.cos(t) + head * np.sin(t)
+            self._model_stream = np.concatenate([self._model_stream[:-xfade_n], mixed, s[xfade_n:]], axis=0)
+            new_part = s[xfade_n:]
         else:
-            # emulate your prior continuity update:
-            self._model_stream = np.concatenate([self._model_stream[:-xfade_n], mixed_model if 'mixed_model' in locals() else head, s[xfade_n:]], axis=0)
+            self._model_stream = np.concatenate([self._model_stream, s], axis=0)
+            new_part = s
 
-        # ----- (D) Store this chunk's tail at model rate for the next correction step -----
-        self._pending_tail_model = tail.copy()
+        # spool only the *new* non-overlapped part
+        if new_part.size:
+            y = (new_part.astype(np.float32, copy=False)
+                 if self._rs is None else
+                 self._rs.process(new_part.astype(np.float32, copy=False), final=False))
+            if y.size:
+                self._spool = np.concatenate([self._spool, y], axis=0)
+                self._spool_written += y.shape[0]
 
     def _should_generate_next_chunk(self) -> bool:
         # Allow running ahead relative to whichever is larger: last *consumed*
