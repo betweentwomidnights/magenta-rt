@@ -625,12 +625,38 @@ class JamWorker(threading.Thread):
                 break  # need more audio
             loop = self._spool[start:end]
 
-            # Loudness match to reference loop (optional)
-            if self.params.ref_loop is not None and self.params.loudness_mode != "none":
-                ref = self.params.ref_loop.as_stereo().resample(self.params.target_sr)
-                wav = au.Waveform(loop.copy(), int(self.params.target_sr))
-                matched, _ = match_loudness_to_reference(ref, wav, method=self.params.loudness_mode, headroom_db=self.params.headroom_db)
-                loop = matched.samples
+            # Loudness match per chunk (bar-aligned reference)
+            if self.params.loudness_mode != "none" and self.params.combined_loop is not None:
+                sr = int(self.params.target_sr)
+
+                # 1) Get the combined loop at target SR (stereo, float32)
+                comb = self.params.combined_loop.as_stereo().resample(sr).samples.astype(np.float32, copy=False)
+                if comb.ndim == 1:
+                    comb = comb[:, None]
+                if comb.shape[1] == 1:
+                    comb = np.repeat(comb, 2, axis=1)
+
+                # 2) Build a reference slice aligned to this outgoing chunk [start:end]
+                #    We wrap/tile the combined loop so it always covers the needed range.
+                need = end - start
+                if comb.shape[0] > 0 and need > 0:
+                    s = start % comb.shape[0]
+                    if s + need <= comb.shape[0]:
+                        ref_slice = comb[s:s+need]
+                    else:
+                        part1 = comb[s:]
+                        part2 = comb[:max(0, need - part1.shape[0])]
+                        ref_slice = np.vstack([part1, part2])
+
+                    ref = au.Waveform(ref_slice, sr)
+                    tgt = au.Waveform(loop.copy(), sr)
+
+                    matched, _stats = match_loudness_to_reference(
+                        ref, tgt,
+                        method=self.params.loudness_mode,
+                        headroom_db=self.params.headroom_db
+                    )
+                    loop = matched.samples
 
             audio_b64, total_samples, channels = wav_bytes_base64(loop, int(self.params.target_sr))
             meta = {
