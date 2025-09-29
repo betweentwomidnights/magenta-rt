@@ -112,21 +112,17 @@ def generate_loop_continuation_with_mrt(
     # Final exact-length trim to requested bars
     out = hard_trim_seconds(stitched, total_secs)
 
-    # (optional) keep micro fades
+    # Final polish AFTER drop
+    out = out.peak_normalize(0.95)
     apply_micro_fades(out, 5)
 
-    # Bar-wise loudness match so bar 1 sits right even if the model ramps up
-    out, loud_stats = apply_barwise_loudness_match(
-        out,
-        ref_loop=loop,                 # same source the jam path tiles per chunk
-        bpm=bpm,
-        beats_per_bar=beats_per_bar,
-        method=loudness_mode,
-        headroom_db=loudness_headroom_db,
+    # Loudness match to input (after drop) so bar 1 sits right
+    out, loud_stats = match_loudness_to_reference(
+        ref=loop, target=out,
+        method=loudness_mode, headroom_db=loudness_headroom_db
     )
 
-    # Optionally finish with a light peak cap to ~-1 dBFS (no re-scaling)
-    out = out.peak_normalize(0.95)
+    return out, loud_stats
 
 
 def generate_style_only_with_mrt(
@@ -235,6 +231,8 @@ def apply_barwise_loudness_match(
     need = y.shape[0]
     reps = int(np.ceil(need / float(ref.shape[0]))) if ref.shape[0] else 1
     ref_tiled = np.tile(ref, (max(1, reps), 1))[:need]
+
+    from .utils import match_loudness_to_reference  # same module in your tree
 
     gains_db = []
     out_adj = y.copy()
