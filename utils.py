@@ -111,44 +111,40 @@ def apply_micro_fades(wav: au.Waveform, ms: int = 5) -> None:
 # ---------- Token context helpers ----------
 def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_bar=4):
     """
-    Return a ctx_frames-long slice of `tokens` whose **end** lands on the nearest
-    whole-bar boundary in codec-frame space, even when frames_per_bar is fractional.
-
-    tokens: np.ndarray of shape (T, D) or (T,) where T = codec frames
-    bpm: float
-    fps: float (codec frames per second; keep this as float)
-    ctx_frames: int (length of context window in codec frames)
-    beats_per_bar: int
+    Return a ctx_frames-long slice of `tokens` whose **end** lands on an integer
+    bar boundary in codec-frame space (model runs at `fps`, typically 25).
     """
- 
 
     if tokens is None:
         raise ValueError("tokens is None")
     tokens = np.asarray(tokens)
     if tokens.ndim == 1:
-        tokens = tokens[:, None]  # promote to (T, 1) for uniform tiling
+        tokens = tokens[:, None]
 
     T = tokens.shape[0]
     if T == 0:
         return tokens
 
     fps = float(fps)
-    frames_per_bar_f = (beats_per_bar * 60.0 / float(bpm)) * fps  # float frames per bar
 
-    # Tile a little more than we need so we can always snap the END to a bar boundary
+    # float frames per bar (e.g., ~65.934 at 91 BPM for 4/4 @ 25fps)
+    frames_per_bar_f = (beats_per_bar * 60.0 / float(bpm)) * fps
+
+    # >>> KEY FIX: quantize bar length to an integer number of codec frames
+    frames_per_bar_i = max(1, int(round(frames_per_bar_f)))
+
+    # Tile so we can always snap the *end* to a bar boundary and still have ctx_frames
     reps = int(np.ceil((ctx_frames + T) / float(T))) + 1
     tiled = np.tile(tokens, (reps, 1))
     total = tiled.shape[0]
 
-    # How many whole bars fit?
-    k_bars = int(np.floor(total / frames_per_bar_f))
+    # How many whole integer bars fit in the tiled sequence?
+    k_bars = total // frames_per_bar_i
     if k_bars <= 0:
-        # Fallback: just take the last ctx_frames
-        window = tiled[-ctx_frames:]
-        return window
+        return tiled[-ctx_frames:]
 
-    # Snap END index to the nearest integer frame at a whole-bar boundary
-    end_idx = int(round(k_bars * frames_per_bar_f))
+    # Snap END to an exact integer multiple of frames_per_bar_i
+    end_idx = int(k_bars * frames_per_bar_i)
     end_idx = min(max(end_idx, ctx_frames), total)
     start_idx = end_idx - ctx_frames
     if start_idx < 0:
@@ -157,7 +153,7 @@ def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_ba
 
     window = tiled[start_idx:end_idx]
 
-    # Guard against rare off-by-one due to rounding
+    # Guard off-by-one
     if window.shape[0] < ctx_frames:
         pad = np.tile(tokens, (int(np.ceil((ctx_frames - window.shape[0]) / T)), 1))
         window = np.vstack([window, pad])[:ctx_frames]
@@ -165,6 +161,7 @@ def make_bar_aligned_context(tokens, bpm, fps=25.0, ctx_frames=250, beats_per_ba
         window = window[-ctx_frames:]
 
     return window
+
 
 
 def take_bar_aligned_tail(
