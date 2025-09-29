@@ -236,8 +236,6 @@ def apply_barwise_loudness_match(
     reps = int(np.ceil(need / float(ref.shape[0]))) if ref.shape[0] else 1
     ref_tiled = np.tile(ref, (max(1, reps), 1))[:need]
 
-    from .utils import match_loudness_to_reference  # same module in your tree
-
     gains_db = []
     out_adj = y.copy()
     n_bars = max(1, int(np.ceil(need / float(bar_len))))
