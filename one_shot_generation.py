@@ -112,17 +112,21 @@ def generate_loop_continuation_with_mrt(
     # Final exact-length trim to requested bars
     out = hard_trim_seconds(stitched, total_secs)
 
-    # Final polish AFTER drop
-    out = out.peak_normalize(0.95)
+    # (optional) keep micro fades
     apply_micro_fades(out, 5)
 
-    # Loudness match to input (after drop) so bar 1 sits right
-    out, loud_stats = match_loudness_to_reference(
-        ref=loop, target=out,
-        method=loudness_mode, headroom_db=loudness_headroom_db
+    # Bar-wise loudness match so bar 1 sits right even if the model ramps up
+    out, loud_stats = apply_barwise_loudness_match(
+        out,
+        ref_loop=loop,                 # same source the jam path tiles per chunk
+        bpm=bpm,
+        beats_per_bar=beats_per_bar,
+        method=loudness_mode,
+        headroom_db=loudness_headroom_db,
     )
 
-    return out, loud_stats
+    # Optionally finish with a light peak cap to ~-1 dBFS (no re-scaling)
+    out = out.peak_normalize(0.95)
 
 
 def generate_style_only_with_mrt(
@@ -194,3 +198,80 @@ def generate_style_only_with_mrt(
     apply_micro_fades(out, 5)
 
     return out, None  # loudness stats not applicable (no reference)
+
+
+# loudness matching helper for /generate:
+
+def apply_barwise_loudness_match(
+    out: au.Waveform,
+    ref_loop: au.Waveform,
+    *,
+    bpm: float,
+    beats_per_bar: int,
+    method: str = "auto",
+    headroom_db: float = 1.0,
+    smooth_ms: int = 50,          # small ramp between bars
+) -> tuple[au.Waveform, dict]:
+    """
+    Bar-locked loudness matching. Tiles ref_loop to cover out, then
+    per-bar calls match_loudness_to_reference() and applies gains with
+    a short cross-ramp between bars for smoothness.
+    """
+    sr = int(out.sample_rate)
+    spb = (60.0 / float(bpm)) * int(beats_per_bar)
+    bar_len = int(round(spb * sr))
+
+    y = out.samples.astype(np.float32, copy=False)
+    if y.ndim == 1: y = y[:, None]
+    if ref_loop.sample_rate != sr:
+        ref = ref_loop.resample(sr).as_stereo().samples.astype(np.float32, copy=False)
+    else:
+        ref = ref_loop.as_stereo().samples.astype(np.float32, copy=False)
+
+    if ref.ndim == 1: ref = ref[:, None]
+    if ref.shape[1] == 1: ref = np.repeat(ref, 2, axis=1)
+
+    # tile reference to length of out
+    need = y.shape[0]
+    reps = int(np.ceil(need / float(ref.shape[0]))) if ref.shape[0] else 1
+    ref_tiled = np.tile(ref, (max(1, reps), 1))[:need]
+
+    from .utils import match_loudness_to_reference  # same module in your tree
+
+    gains_db = []
+    out_adj = y.copy()
+    n_bars = max(1, int(np.ceil(need / float(bar_len))))
+    ramp = int(max(0, round(smooth_ms * sr / 1000.0)))
+
+    for i in range(n_bars):
+        s = i * bar_len
+        e = min(need, s + bar_len)
+        if e <= s: break
+
+        ref_bar = au.Waveform(ref_tiled[s:e], sr)
+        tgt_bar = au.Waveform(out_adj[s:e], sr)
+
+        matched_bar, stats = match_loudness_to_reference(
+            ref_bar, tgt_bar, method=method, headroom_db=headroom_db
+        )
+        # compute linear gain we actually applied
+        g = matched_bar.samples.astype(np.float32, copy=False)
+        if tgt_bar.samples.size > 0:
+            # avoid divide-by-zero; infer average gain over the bar
+            eps = 1e-12
+            g_lin = float(np.sqrt((np.mean(g**2) + eps) / (np.mean(tgt_bar.samples**2) + eps)))
+        else:
+            g_lin = 1.0
+        gains_db.append(20.0 * np.log10(max(g_lin, 1e-6)))
+
+        # write with a short cross-ramp from previous bar
+        if i > 0 and ramp > 0:
+            r0 = max(s, s + ramp - (e - s))  # clamp if last bar shorter
+            t = np.linspace(0.0, 1.0, r0 - s, dtype=np.float32)[:, None]
+            out_adj[s:r0] = (1.0 - t) * out_adj[s:r0] + t * g[:r0-s]
+            out_adj[r0:e] = g[r0-s:e-s]
+        else:
+            out_adj[s:e] = g
+
+    out.samples = out_adj.astype(np.float32, copy=False)
+    return out, {"per_bar_gain_db": gains_db}
