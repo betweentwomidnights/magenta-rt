@@ -29,6 +29,7 @@ def generate_loop_continuation_with_mrt(
     loudness_mode: str = "auto",
     loudness_headroom_db: float = 1.0,
     intro_bars_to_drop: int = 0,
+    progress_cb=None
 ):
     """
     Generate a continuation of an input loop using MagentaRT.
@@ -45,6 +46,7 @@ def generate_loop_continuation_with_mrt(
         loudness_mode: Loudness matching method ("auto", "lufs", "rms", "none")
         loudness_headroom_db: Headroom in dB for peak limiting
         intro_bars_to_drop: Number of intro bars to generate then drop
+        progress_cb: Braindead progress updates for JUCE
         
     Returns:
         Tuple of (au.Waveform output, dict loudness_stats)
@@ -90,13 +92,18 @@ def generate_loop_continuation_with_mrt(
 
     # Chunk scheduling to cover gen_total_secs
     chunk_secs = mrt.config.chunk_length_frames * mrt.config.frame_length_samples / mrt.sample_rate  # ~2.0
-    steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1  # pad then trim
+    steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1
+
+    if progress_cb:
+        progress_cb(0, steps)  # announce total before first chunk
 
     # Generate
     chunks = []
-    for _ in range(steps):
+    for i in range(steps):
         wav, state = mrt.generate_chunk(state=state, style=combined_style)
         chunks.append(wav)
+        if progress_cb:
+            progress_cb(i + 1, steps)   # <-- report chunk progress
 
     # Stitch continuous audio
     stitched = stitch_generated(chunks, mrt.sample_rate, mrt.config.crossfade_length).as_stereo()

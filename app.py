@@ -205,6 +205,8 @@ _patch_t5x_for_gpu_coords()
 jam_registry: dict[str, JamWorker] = {}
 jam_lock = threading.Lock()
 
+
+
 @contextmanager
 def mrt_overrides(mrt, **kwargs):
     """Temporarily set attributes on MRT if they exist; restore after."""
@@ -331,6 +333,33 @@ app.add_middleware(
 _MRT = None
 _MRT_LOCK = threading.Lock()
 
+_PROGRESS = {}
+_PROGRESS_LOCK = threading.Lock()
+
+def _progress_update(req_id: str, n: int, total: int, stage: str = "generating"):
+    if not req_id: 
+        return
+    with _PROGRESS_LOCK:
+        _PROGRESS[req_id] = {
+            "n": int(n),
+            "total": int(total),
+            "percent": int(round(100.0 * max(0, min(n, total)) / max(1, total))),
+            "stage": stage,
+            "ts": time.time(),
+        }
+
+def _progress_done(req_id: str):
+    if not req_id: 
+        return
+    with _PROGRESS_LOCK:
+        st = _PROGRESS.get(req_id, {})
+        total = st.get("total") or st.get("n") or 1
+        _PROGRESS[req_id] = {"n": total, "total": total, "percent": 100, "stage": "done", "ts": time.time()}
+
+def _progress_get(req_id: str):
+    with _PROGRESS_LOCK:
+        return _PROGRESS.get(req_id, {"percent": 0, "stage": "pending"})
+
 def get_mrt():
     global _MRT
     if _MRT is None:
@@ -440,6 +469,8 @@ def _boot():
     # 2) Start warmup in the background (unchanged behavior)
     if os.getenv("MRT_WARMUP", "1") != "0":
         threading.Thread(target=_mrt_warmup, name="mrt-warmup", daemon=True).start()
+
+
 
 @app.get("/model/status")
 def model_status():
@@ -674,7 +705,9 @@ def model_select(req: ModelSelect):
 # one-shot generation
 # ----------------------------
 
-
+@app.get("/progress")
+def progress(request_id: str):
+    return _progress_get(request_id)
 
 @app.post("/generate")
 def generate(
@@ -691,76 +724,136 @@ def generate(
     temperature: float = Form(1.1),
     topk: int = Form(40),
     target_sample_rate: int | None = Form(None),
-    intro_bars_to_drop: int = Form(0),          # <— NEW
+    intro_bars_to_drop: int = Form(0),
+    request_id: str = Form(None),
 ):
-    # Read file
-    data = loop_audio.file.read()
-    if not data:
-        return {"error": "Empty file"}
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
+    req_id = request_id or str(uuid.uuid4())
+    tmp_path = None
 
-    # Parse styles + weights
-    extra_styles = [s for s in (styles.split(",") if styles else []) if s.strip()]
-    weights = [float(x) for x in style_weights.split(",")] if style_weights else None
+    try:
+        # 0) Read file -> tmp wav
+        data = loop_audio.file.read()
+        if not data:
+            # finalize progress as error and return
+            with _PROGRESS_LOCK:
+                _PROGRESS[req_id] = {
+                    "percent": 100,
+                    "stage": "error",
+                    "error": "Empty file",
+                    "ts": time.time(),
+                }
+            return {"error": "Empty file", "request_id": req_id}
 
-    mrt = get_mrt()  # warm once, in this worker thread
-    # Temporarily override MRT inference knobs for this request
-    with mrt_overrides(mrt,
-                       guidance_weight=guidance_weight,
-                       temperature=temperature,
-                       topk=topk):
-        wav, loud_stats = generate_loop_continuation_with_mrt(
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        # 1) Parse styles + weights
+        extra_styles = [s.strip() for s in (styles.split(",") if styles else []) if s.strip()]
+        weights = [float(x) for x in style_weights.split(",")] if style_weights else None
+
+        # 2) Get model and apply per-request overrides
+        mrt = get_mrt()
+        with mrt_overrides(
             mrt,
-            input_wav_path=tmp_path,
-            bpm=bpm,
-            extra_styles=extra_styles,
-            style_weights=weights,
-            bars=bars,
-            beats_per_bar=beats_per_bar,
-            loop_weight=loop_weight,
-            loudness_mode=loudness_mode,
-            loudness_headroom_db=loudness_headroom_db,
-            intro_bars_to_drop=intro_bars_to_drop,   # <— pass through
+            guidance_weight=guidance_weight,
+            temperature=temperature,
+            topk=topk,
+        ):
+            # progress callback (called from the generator loop)
+            def on_chunk(i, total):
+                _progress_update(req_id, i, total, stage="generating")
+
+            # 2a) (optional) emit initial 0% once steps are known:
+            #     We'll do this inside the generator right after steps is computed.
+            wav, loud_stats = generate_loop_continuation_with_mrt(
+                mrt,
+                input_wav_path=tmp_path,
+                bpm=bpm,
+                extra_styles=extra_styles,
+                style_weights=weights,
+                bars=bars,
+                beats_per_bar=beats_per_bar,
+                loop_weight=loop_weight,
+                loudness_mode=loudness_mode,
+                loudness_headroom_db=loudness_headroom_db,
+                intro_bars_to_drop=intro_bars_to_drop,
+                progress_cb=on_chunk,
+            )
+
+        # 3) Post-process stages (optional: expose sub-stages for nicer UI)
+        #    Mark "postprocess" before we resample/snap/encode.
+        st = _PROGRESS_GET(req_id) if False else None  # (placeholder so lints don't complain)
+        _progress_update(
+            req_id,
+            _progress_get(req_id).get("total", 1),
+            _progress_get(req_id).get("total", 1),
+            "postprocess",
         )
 
-    # 1) Figure out the desired SR
-    inp_info = sf.info(tmp_path)
-    input_sr = int(inp_info.samplerate)
-    target_sr = int(target_sample_rate or input_sr)
+        # 3a) Determine SR
+        inp_info = sf.info(tmp_path)
+        input_sr = int(inp_info.samplerate)
+        target_sr_val = int(target_sample_rate or input_sr)
 
-    # 2) Convert to target SR + snap to exact bars
-    cur_sr = int(mrt.sample_rate)
-    x = wav.samples if wav.samples.ndim == 2 else wav.samples[:, None]
-    seconds_per_bar = (60.0 / float(bpm)) * int(beats_per_bar)
-    expected_secs = float(bars) * seconds_per_bar
-    x = resample_and_snap(x, cur_sr=cur_sr, target_sr=target_sr, seconds=expected_secs)
+        # 3b) Convert SR + snap to exact bars
+        cur_sr = int(mrt.sample_rate)
+        x = wav.samples if wav.samples.ndim == 2 else wav.samples[:, None]
+        seconds_per_bar = (60.0 / float(bpm)) * int(beats_per_bar)
+        expected_secs = float(bars) * seconds_per_bar
 
-    # 3) Encode WAV once (no extra write)
-    audio_b64, total_samples, channels = wav_bytes_base64(x, target_sr)
-    loop_duration_seconds = total_samples / float(target_sr)
+        # (optional) sub-stage
+        _progress_update(req_id, _progress_get(req_id).get("total", 1), _progress_get(req_id).get("total", 1), "resample_and_snap")
+        x = resample_and_snap(x, cur_sr=cur_sr, target_sr=target_sr_val, seconds=expected_secs)
 
-    # 4) Metadata
-    metadata = {
-        "bpm": int(round(bpm)),
-        "bars": int(bars),
-        "beats_per_bar": int(beats_per_bar),
-        "styles": extra_styles,
-        "style_weights": weights,
-        "loop_weight": loop_weight,
-        "loudness": loud_stats,
-        "sample_rate": int(target_sr),
-        "channels": int(channels),
-        "crossfade_seconds": mrt.config.crossfade_length,
-        "total_samples": int(total_samples),
-        "seconds_per_bar": seconds_per_bar,
-        "loop_duration_seconds": loop_duration_seconds,
-        "guidance_weight": guidance_weight,
-        "temperature": temperature,
-        "topk": topk,
-    }
-    return {"audio_base64": audio_b64, "metadata": metadata}
+        # 3c) Encode WAV -> base64
+        _progress_update(req_id, _progress_get(req_id).get("total", 1), _progress_get(req_id).get("total", 1), "encode")
+        audio_b64, total_samples, channels = wav_bytes_base64(x, target_sr_val)
+        loop_duration_seconds = total_samples / float(target_sr_val)
+
+        # 4) Metadata
+        metadata = {
+            "bpm": int(round(bpm)),
+            "bars": int(bars),
+            "beats_per_bar": int(beats_per_bar),
+            "styles": extra_styles,
+            "style_weights": weights,
+            "loop_weight": loop_weight,
+            "loudness": loud_stats,
+            "sample_rate": int(target_sr_val),
+            "channels": int(channels),
+            "crossfade_seconds": mrt.config.crossfade_length,
+            "total_samples": int(total_samples),
+            "seconds_per_bar": seconds_per_bar,
+            "loop_duration_seconds": loop_duration_seconds,
+            "guidance_weight": guidance_weight,
+            "temperature": temperature,
+            "topk": topk,
+        }
+
+        _progress_done(req_id)
+        return {"audio_base64": audio_b64, "metadata": metadata, "request_id": req_id}
+
+    except Exception as e:
+        # Flip to error state so the UI stops polling and can show a message
+        with _PROGRESS_LOCK:
+            _PROGRESS[req_id] = {
+                "percent": 100,
+                "stage": "error",
+                "error": str(e),
+                "ts": time.time(),
+            }
+        # Re-raise so FastAPI returns a 500 (or your exception handler formats it)
+        raise
+
+    finally:
+        # Clean up temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
 
 # new endpoint to return a bar-aligned chunk without the need for combined audio
 
