@@ -218,12 +218,12 @@ def apply_barwise_loudness_match(
     beats_per_bar: int,
     method: str = "auto",
     headroom_db: float = 1.0,
-    smooth_ms: int = 50,          # small ramp between bars
+    smooth_ms: int = 50,
 ) -> tuple[au.Waveform, dict]:
     """
-    Bar-locked loudness matching. Tiles ref_loop to cover out, then
-    per-bar calls match_loudness_to_reference() and applies gains with
-    a short cross-ramp between bars for smoothness.
+    Bar-locked loudness matching that establishes the correct starting level
+    then maintains consistency. Only the first bar is matched to the reference;
+    subsequent bars maintain relative dynamics while preventing drift.
     """
     sr = int(out.sample_rate)
     spb = (60.0 / float(bpm)) * int(beats_per_bar)
@@ -231,6 +231,7 @@ def apply_barwise_loudness_match(
 
     y = out.samples.astype(np.float32, copy=False)
     if y.ndim == 1: y = y[:, None]
+    
     if ref_loop.sample_rate != sr:
         ref = ref_loop.resample(sr).as_stereo().samples.astype(np.float32, copy=False)
     else:
@@ -239,17 +240,17 @@ def apply_barwise_loudness_match(
     if ref.ndim == 1: ref = ref[:, None]
     if ref.shape[1] == 1: ref = np.repeat(ref, 2, axis=1)
 
-    # tile reference to length of out
-    need = y.shape[0]
-    reps = int(np.ceil(need / float(ref.shape[0]))) if ref.shape[0] else 1
-    ref_tiled = np.tile(ref, (max(1, reps), 1))[:need]
+    from utils import match_loudness_to_reference
 
+    # Measure reference loudness once (use first bar's worth if reference is long)
+    ref_bar_len = min(ref.shape[0], bar_len)
+    ref_bar = au.Waveform(ref[:ref_bar_len], sr)
+    
     gains_db = []
     out_adj = y.copy()
+    need = y.shape[0]
     n_bars = max(1, int(np.ceil(need / float(bar_len))))
     ramp = int(max(0, round(smooth_ms * sr / 1000.0)))
-    
-    # Minimum duration for LUFS measurement (400ms)
     min_lufs_samples = int(0.4 * sr)
 
     for i in range(n_bars):
@@ -258,38 +259,33 @@ def apply_barwise_loudness_match(
         if e <= s: 
             break
         
-        bar_duration = (e - s) / float(sr)
         bar_samples = e - s
-
-        ref_bar = au.Waveform(ref_tiled[s:e], sr)
         tgt_bar = au.Waveform(out_adj[s:e], sr)
 
-        # Skip loudness matching for bars shorter than LUFS minimum
-        if method in ("auto", "lufs") and bar_samples < min_lufs_samples:
-            # Fallback: use RMS for short segments, or skip entirely
-            effective_method = "rms"
+        # First bar: match to reference to establish starting level
+        if i == 0:
+            effective_method = "rms" if bar_samples < min_lufs_samples else method
+            matched_bar, stats = match_loudness_to_reference(
+                ref_bar, tgt_bar, method=effective_method, headroom_db=headroom_db
+            )
         else:
-            effective_method = method
+            # Subsequent bars: just copy through (preserves model's dynamics)
+            matched_bar = tgt_bar
 
-        matched_bar, stats = match_loudness_to_reference(
-            ref_bar, tgt_bar, method=effective_method, headroom_db=headroom_db
-        )
-        
-        # compute linear gain we actually applied
         g = matched_bar.samples.astype(np.float32, copy=False)
+        
+        # Calculate gain that was applied
         if tgt_bar.samples.size > 0:
-            # avoid divide-by-zero; infer average gain over the bar
             eps = 1e-12
             g_lin = float(np.sqrt((np.mean(g**2) + eps) / (np.mean(tgt_bar.samples**2) + eps)))
         else:
             g_lin = 1.0
         gains_db.append(20.0 * np.log10(max(g_lin, 1e-6)))
 
-        # write with a short cross-ramp from previous bar
+        # Apply with ramp for smoothness
         if i > 0 and ramp > 0:
-            ramp_len = min(ramp, e - s)  # Don't ramp longer than the bar
+            ramp_len = min(ramp, e - s)
             t = np.linspace(0.0, 1.0, ramp_len, dtype=np.float32)[:, None]
-            # Blend from previous gain to current bar's gain
             out_adj[s:s+ramp_len] = (1.0 - t) * out_adj[s:s+ramp_len] + t * g[:ramp_len]
             out_adj[s+ramp_len:e] = g[ramp_len:e-s]
         else:
