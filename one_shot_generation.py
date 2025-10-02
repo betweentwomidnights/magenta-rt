@@ -120,8 +120,8 @@ def generate_loop_continuation_with_mrt(
     out = hard_trim_seconds(stitched, total_secs)
 
     # Final polish AFTER drop
-    out = out.peak_normalize(0.95)
-    apply_micro_fades(out, 5)
+    # out = out.peak_normalize(0.95)
+    
 
     # Loudness match to input (after drop) so bar 1 sits right
     out, loud_stats = apply_barwise_loudness_match(
@@ -133,6 +133,8 @@ def generate_loop_continuation_with_mrt(
         headroom_db=loudness_headroom_db,
         smooth_ms=50,  # 50ms crossfade between bars
     )
+
+    apply_micro_fades(out, 5)
 
     return out, loud_stats
 
