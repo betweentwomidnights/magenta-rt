@@ -225,7 +225,7 @@ def apply_barwise_loudness_match(
     """
     Bar-locked loudness matching that establishes the correct starting level
     then maintains consistency. Only the first bar is matched to the reference;
-    subsequent bars maintain relative dynamics while preventing drift.
+    subsequent bars use the same gain to maintain relative dynamics.
     """
     sr = int(out.sample_rate)
     spb = (60.0 / float(bpm)) * int(beats_per_bar)
@@ -244,7 +244,7 @@ def apply_barwise_loudness_match(
 
     from utils import match_loudness_to_reference
 
-    # Measure reference loudness once (use first bar's worth if reference is long)
+    # Measure reference loudness once
     ref_bar_len = min(ref.shape[0], bar_len)
     ref_bar = au.Waveform(ref[:ref_bar_len], sr)
     
@@ -254,7 +254,10 @@ def apply_barwise_loudness_match(
     n_bars = max(1, int(np.ceil(need / float(bar_len))))
     ramp = int(max(0, round(smooth_ms * sr / 1000.0)))
     min_lufs_samples = int(0.4 * sr)
-
+    
+    # Calculate gain from bar 0 matching
+    first_bar_gain_linear = 1.0
+    
     for i in range(n_bars):
         s = i * bar_len
         e = min(need, s + bar_len)
@@ -262,21 +265,27 @@ def apply_barwise_loudness_match(
             break
         
         bar_samples = e - s
-        tgt_bar = au.Waveform(out_adj[s:e], sr)
+        tgt_bar = au.Waveform(y[s:e], sr)  # Always read from ORIGINAL
 
-        # First bar: match to reference to establish starting level
+        # First bar: match to reference to establish gain
         if i == 0:
             effective_method = "rms" if bar_samples < min_lufs_samples else method
             matched_bar, stats = match_loudness_to_reference(
                 ref_bar, tgt_bar, method=effective_method, headroom_db=headroom_db
             )
+            
+            # Calculate the linear gain that was applied
+            eps = 1e-12
+            first_bar_gain_linear = float(np.sqrt(
+                (np.mean(matched_bar.samples**2) + eps) / 
+                (np.mean(tgt_bar.samples**2) + eps)
+            ))
+            g = matched_bar.samples.astype(np.float32, copy=False)
         else:
-            # Subsequent bars: just copy through (preserves model's dynamics)
-            matched_bar = tgt_bar
+            # Subsequent bars: apply the same gain from bar 0
+            g = (tgt_bar.samples * first_bar_gain_linear).astype(np.float32, copy=False)
 
-        g = matched_bar.samples.astype(np.float32, copy=False)
-        
-        # Calculate gain that was applied
+        # Calculate gain in dB for stats
         if tgt_bar.samples.size > 0:
             eps = 1e-12
             g_lin = float(np.sqrt((np.mean(g**2) + eps) / (np.mean(tgt_bar.samples**2) + eps)))
