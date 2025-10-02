@@ -248,18 +248,33 @@ def apply_barwise_loudness_match(
     out_adj = y.copy()
     n_bars = max(1, int(np.ceil(need / float(bar_len))))
     ramp = int(max(0, round(smooth_ms * sr / 1000.0)))
+    
+    # Minimum duration for LUFS measurement (400ms)
+    min_lufs_samples = int(0.4 * sr)
 
     for i in range(n_bars):
         s = i * bar_len
         e = min(need, s + bar_len)
-        if e <= s: break
+        if e <= s: 
+            break
+        
+        bar_duration = (e - s) / float(sr)
+        bar_samples = e - s
 
         ref_bar = au.Waveform(ref_tiled[s:e], sr)
         tgt_bar = au.Waveform(out_adj[s:e], sr)
 
+        # Skip loudness matching for bars shorter than LUFS minimum
+        if method in ("auto", "lufs") and bar_samples < min_lufs_samples:
+            # Fallback: use RMS for short segments, or skip entirely
+            effective_method = "rms"
+        else:
+            effective_method = method
+
         matched_bar, stats = match_loudness_to_reference(
-            ref_bar, tgt_bar, method=method, headroom_db=headroom_db
+            ref_bar, tgt_bar, method=effective_method, headroom_db=headroom_db
         )
+        
         # compute linear gain we actually applied
         g = matched_bar.samples.astype(np.float32, copy=False)
         if tgt_bar.samples.size > 0:
@@ -274,7 +289,7 @@ def apply_barwise_loudness_match(
         if i > 0 and ramp > 0:
             ramp_len = min(ramp, e - s)  # Don't ramp longer than the bar
             t = np.linspace(0.0, 1.0, ramp_len, dtype=np.float32)[:, None]
-            # Blend from previous gain (already in out_adj) to current bar's gain
+            # Blend from previous gain to current bar's gain
             out_adj[s:s+ramp_len] = (1.0 - t) * out_adj[s:s+ramp_len] + t * g[:ramp_len]
             out_adj[s+ramp_len:e] = g[ramp_len:e-s]
         else:
