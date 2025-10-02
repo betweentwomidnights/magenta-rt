@@ -124,9 +124,14 @@ def generate_loop_continuation_with_mrt(
     apply_micro_fades(out, 5)
 
     # Loudness match to input (after drop) so bar 1 sits right
-    out, loud_stats = match_loudness_to_reference(
-        ref=loop, target=out,
-        method=loudness_mode, headroom_db=loudness_headroom_db
+    out, loud_stats = apply_barwise_loudness_match(
+        out=out,
+        ref_loop=loop,
+        bpm=bpm,
+        beats_per_bar=beats_per_bar,
+        method=loudness_mode,
+        headroom_db=loudness_headroom_db,
+        smooth_ms=50,  # 50ms crossfade between bars
     )
 
     return out, loud_stats
@@ -239,8 +244,6 @@ def apply_barwise_loudness_match(
     reps = int(np.ceil(need / float(ref.shape[0]))) if ref.shape[0] else 1
     ref_tiled = np.tile(ref, (max(1, reps), 1))[:need]
 
-    from .utils import match_loudness_to_reference  # same module in your tree
-
     gains_db = []
     out_adj = y.copy()
     n_bars = max(1, int(np.ceil(need / float(bar_len))))
@@ -269,10 +272,11 @@ def apply_barwise_loudness_match(
 
         # write with a short cross-ramp from previous bar
         if i > 0 and ramp > 0:
-            r0 = max(s, s + ramp - (e - s))  # clamp if last bar shorter
-            t = np.linspace(0.0, 1.0, r0 - s, dtype=np.float32)[:, None]
-            out_adj[s:r0] = (1.0 - t) * out_adj[s:r0] + t * g[:r0-s]
-            out_adj[r0:e] = g[r0-s:e-s]
+            ramp_len = min(ramp, e - s)  # Don't ramp longer than the bar
+            t = np.linspace(0.0, 1.0, ramp_len, dtype=np.float32)[:, None]
+            # Blend from previous gain (already in out_adj) to current bar's gain
+            out_adj[s:s+ramp_len] = (1.0 - t) * out_adj[s:s+ramp_len] + t * g[:ramp_len]
+            out_adj[s+ramp_len:e] = g[ramp_len:e-s]
         else:
             out_adj[s:e] = g
 
