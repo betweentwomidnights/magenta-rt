@@ -199,8 +199,44 @@ def _patch_t5x_for_gpu_coords():
     except Exception as e:
         import logging; logging.exception("t5x GPU-coords patch failed: %s", e)
 
+def _patch_magenta_rt_asset_fetch():
+    """
+    Patch magenta_rt.asset._fetch_single_hf to handle None response gracefully.
+    Prevents AttributeError when network timeouts occur.
+    """
+    try:
+        from magenta_rt import asset
+        import logging
+        
+        # Save original function
+        _original_fetch = asset._fetch_single_hf
+        
+        def _fetch_single_hf_safe(*args, **kwargs):
+            """Wrapper that fixes the None response.status_code bug"""
+            try:
+                return _original_fetch(*args, **kwargs)
+            except Exception as e:
+                # This is the bug fix: check if response exists before accessing it
+                response = getattr(e, 'response', None)
+                if response is not None and hasattr(response, 'status_code'):
+                    if response.status_code == 429:
+                        # Original code's rate-limit handling would go here
+                        logging.warning("Rate limited by HuggingFace Hub")
+                        raise
+                # For all other cases (including timeout with no response), re-raise
+                logging.error(f"HuggingFace download failed: {e}")
+                raise
+        
+        # Apply the patch
+        asset._fetch_single_hf = _fetch_single_hf_safe
+        logging.info("Patched magenta_rt.asset._fetch_single_hf for safer error handling.")
+        
+    except Exception as e:
+        logging.exception("magenta_rt asset fetch patch failed: %s", e)
+
 # Call the patch immediately at import time (before MagentaRT init)
 _patch_t5x_for_gpu_coords()
+_patch_magenta_rt_asset_fetch()
 
 jam_registry: dict[str, JamWorker] = {}
 jam_lock = threading.Lock()

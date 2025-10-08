@@ -33,97 +33,112 @@ def generate_loop_continuation_with_mrt(
 ):
     """
     Generate a continuation of an input loop using MagentaRT.
-    
-    Args:
-        mrt: MagentaRT instance
-        input_wav_path: Path to input audio file
-        bpm: Beats per minute
-        extra_styles: List of additional text style prompts (optional)
-        style_weights: List of weights for style prompts (optional)
-        bars: Number of bars to generate
-        beats_per_bar: Beats per bar (typically 4)
-        loop_weight: Weight for the input loop's style embedding
-        loudness_mode: Loudness matching method ("auto", "lufs", "rms", "none")
-        loudness_headroom_db: Headroom in dB for peak limiting
-        intro_bars_to_drop: Number of intro bars to generate then drop
-        progress_cb: Braindead progress updates for JUCE
-        
-    Returns:
-        Tuple of (au.Waveform output, dict loudness_stats)
     """
+    
+    # ===== NEW: Force codec/model reset before generation =====
+    # Clear any accumulated state in the codec that might cause silence issues
+    try:
+        # Option 1: If codec has explicit reset
+        if hasattr(mrt.codec, 'reset') and callable(mrt.codec.reset):
+            mrt.codec.reset()
+        
+        # Option 2: Force clear any cached codec state
+        if hasattr(mrt.codec, '_encode_cache'):
+            mrt.codec._encode_cache = None
+        if hasattr(mrt.codec, '_decode_cache'):
+            mrt.codec._decode_cache = None
+            
+        # Option 3: Clear JAX compilation caches (nuclear but effective)
+        # Uncomment if issues persist:
+        # import jax
+        # jax.clear_caches()
+        
+    except Exception as e:
+        import logging
+        logging.warning(f"Codec reset attempt failed (non-fatal): {e}")
+    # ============================================================
+    
     # Load & prep (unchanged)
     loop = au.Waveform.from_file(input_wav_path).resample(mrt.sample_rate).as_stereo()
 
-    # Use tail for context (your recent change)
+    # Use tail for context
     codec_fps   = float(mrt.codec.frame_rate)
     ctx_seconds = float(mrt.config.context_length_frames) / codec_fps
     loop_for_context = take_bar_aligned_tail(loop, bpm, beats_per_bar, ctx_seconds)
 
-    tokens_full = mrt.codec.encode(loop_for_context).astype(np.int32)
-    tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth]
+    # ===== NEW: Force fresh token copies =====
+    tokens_full = mrt.codec.encode(loop_for_context).astype(np.int32, copy=True)  # ← Added copy=True
+    tokens = tokens_full[:, :mrt.config.decoder_codec_rvq_depth].copy()  # ← Added .copy()
+    # ==========================================
 
-    # Bar-aligned token window (unchanged)
+    # Bar-aligned token window
     context_tokens = make_bar_aligned_context(
         tokens, bpm=bpm, fps=float(mrt.codec.frame_rate),
         ctx_frames=mrt.config.context_length_frames, beats_per_bar=beats_per_bar
     )
+    
+    # ===== NEW: More aggressive state initialization =====
     state = mrt.init_state()
-    state.context_tokens = context_tokens
+    
+    # Ensure context_tokens is a fresh array, not a view
+    state.context_tokens = np.array(context_tokens, dtype=np.int32, copy=True)
+    
+    # If there's any internal model state cache, clear it
+    if hasattr(state, '_cache'):
+        state._cache = None
+    # =====================================================
 
-    # STYLE embed (optional: switch to loop_for_context if you want stronger "recent" bias)
+    # STYLE embed (unchanged but ensure fresh embedding)
     loop_embed = mrt.embed_style(loop_for_context)
-    embeds, weights = [loop_embed], [float(loop_weight)]
+    embeds, weights = [loop_embed.copy()], [float(loop_weight)]  # ← Added .copy()
     if extra_styles:
         for i, s in enumerate(extra_styles):
             if s.strip():
-                embeds.append(mrt.embed_style(s.strip()))
+                embeds.append(mrt.embed_style(s.strip()).copy())  # ← Added .copy()
                 w = style_weights[i] if (style_weights and i < len(style_weights)) else 1.0
                 weights.append(float(w))
     wsum = float(sum(weights)) or 1.0
     weights = [w / wsum for w in weights]
-    combined_style = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(loop_embed.dtype)
+    combined_style = np.sum([w * e for w, e in zip(weights, embeds)], axis=0).astype(loop_embed.dtype, copy=True)  # ← Added copy=True
 
-    # --- Length math ---
+    # --- Length math (unchanged) ---
     seconds_per_bar = beats_per_bar * (60.0 / bpm)
     total_secs      = bars * seconds_per_bar
     drop_bars       = max(0, int(intro_bars_to_drop))
-    drop_secs       = min(drop_bars, bars) * seconds_per_bar       # clamp to <= bars
-    gen_total_secs  = total_secs + drop_secs                       # generate extra
+    drop_secs       = min(drop_bars, bars) * seconds_per_bar
+    gen_total_secs  = total_secs + drop_secs
 
-    # Chunk scheduling to cover gen_total_secs
-    chunk_secs = mrt.config.chunk_length_frames * mrt.config.frame_length_samples / mrt.sample_rate  # ~2.0
+    chunk_secs = mrt.config.chunk_length_frames * mrt.config.frame_length_samples / mrt.sample_rate
     steps = int(math.ceil(gen_total_secs / chunk_secs)) + 1
 
     if progress_cb:
-        progress_cb(0, steps)  # announce total before first chunk
+        progress_cb(0, steps)
 
-    # Generate
+    # ===== NEW: Generation loop with explicit state refresh =====
     chunks = []
     for i in range(steps):
-        wav, state = mrt.generate_chunk(state=state, style=combined_style)
+        # Generate chunk with current state
+        wav, new_state = mrt.generate_chunk(state=state, style=combined_style)
         chunks.append(wav)
+        
+        # CRITICAL: Replace state, don't mutate it
+        # This ensures we're not accumulating corrupted state
+        state = new_state
+        
         if progress_cb:
-            progress_cb(i + 1, steps)   # <-- report chunk progress
+            progress_cb(i + 1, steps)
+    # ============================================================
 
-    # Stitch continuous audio
+    # Rest of the function unchanged...
     stitched = stitch_generated(chunks, mrt.sample_rate, mrt.config.crossfade_length).as_stereo()
-
-    # Trim to generated length (bars + dropped bars)
     stitched = hard_trim_seconds(stitched, gen_total_secs)
 
-    # 👉 Drop the intro bars
     if drop_secs > 0:
         n_drop = int(round(drop_secs * stitched.sample_rate))
         stitched = au.Waveform(stitched.samples[n_drop:], stitched.sample_rate)
 
-    # Final exact-length trim to requested bars
     out = hard_trim_seconds(stitched, total_secs)
 
-    # Final polish AFTER drop
-    # out = out.peak_normalize(0.95)
-    
-
-    # Loudness match to input (after drop) so bar 1 sits right
     out, loud_stats = apply_barwise_loudness_match(
         out=out,
         ref_loop=loop,
@@ -131,7 +146,7 @@ def generate_loop_continuation_with_mrt(
         beats_per_bar=beats_per_bar,
         method=loudness_mode,
         headroom_db=loudness_headroom_db,
-        smooth_ms=50,  # 50ms crossfade between bars
+        smooth_ms=50,
     )
 
     apply_micro_fades(out, 5)
