@@ -372,6 +372,67 @@ _MRT_LOCK = threading.Lock()
 _PROGRESS = {}
 _PROGRESS_LOCK = threading.Lock()
 
+_GENERATE_COUNTER = 0
+_GENERATE_COUNTER_LOCK = threading.Lock()
+
+# In app.py, near the top with other globals
+_GENERATE_COUNTER = 0
+_GENERATE_COUNTER_LOCK = threading.Lock()
+
+def _light_reset_mrt(mrt):
+    """
+    Lightweight reset that clears accumulated state without full recompilation.
+    Should take <1 second instead of 30 seconds.
+    """
+    import logging
+    logging.info("Performing light MRT reset after prolonged use...")
+    
+    try:
+        # 1. Clear JAX device arrays (but not compiled functions)
+        import jax
+        for device in jax.devices():
+            # Force garbage collection on device
+            try:
+                device.clear_memory()  # If available in your JAX version
+            except AttributeError:
+                pass
+        
+        # 2. Clear any MRT-level caches
+        attrs_to_clear = ['_last_state', '_generation_cache', '_style_cache']
+        for attr in attrs_to_clear:
+            if hasattr(mrt, attr):
+                setattr(mrt, attr, None)
+        
+        # 3. Clear codec internal state
+        codec_attrs = [
+            '_encode_state', '_decode_state', 
+            '_encoder_cache', '_decoder_cache',
+            '_buffer', '_frame_buffer'
+        ]
+        for attr in codec_attrs:
+            if hasattr(mrt.codec, attr):
+                setattr(mrt.codec, attr, None)
+        
+        # 4. Force Python garbage collection
+        import gc
+        gc.collect()
+        
+        # 5. If style model has cache, clear it
+        if hasattr(mrt, 'style_model'):
+            if hasattr(mrt.style_model, 'clear_cache'):
+                mrt.style_model.clear_cache()
+            # Clear any embedding caches
+            for attr in ['_embed_cache', '_text_cache']:
+                if hasattr(mrt.style_model, attr):
+                    setattr(mrt.style_model, attr, None)
+        
+        logging.info("Light reset complete")
+        return True
+        
+    except Exception as e:
+        logging.warning(f"Light reset partially failed (non-fatal): {e}")
+        return False
+
 def _progress_update(req_id: str, n: int, total: int, stage: str = "generating"):
     if not req_id: 
         return
@@ -741,6 +802,26 @@ def model_select(req: ModelSelect):
 # one-shot generation
 # ----------------------------
 
+@app.post("/generate/reset")
+def generate_reset():
+    """
+    Manually trigger a light reset of the generation system.
+    Useful if user notices quality degradation without full restart.
+    """
+    global _GENERATE_COUNTER
+    
+    with _GENERATE_COUNTER_LOCK:
+        _GENERATE_COUNTER = 0  # Reset counter
+    
+    mrt = get_mrt()
+    success = _light_reset_mrt(mrt)
+    
+    return {
+        "reset": success,
+        "message": "Light reset complete" if success else "Reset partially completed",
+        "counter_reset": True
+    }
+
 @app.get("/progress")
 def progress(request_id: str):
     return _progress_get(request_id)
@@ -762,11 +843,26 @@ def generate(
     target_sample_rate: int | None = Form(None),
     intro_bars_to_drop: int = Form(0),
     request_id: str = Form(None),
+    force_reset: bool = Form(False),  # NEW: Manual reset trigger
 ):
+    global _GENERATE_COUNTER
+
     req_id = request_id or str(uuid.uuid4())
     tmp_path = None
 
     try:
+        # Check if we need a periodic reset
+        with _GENERATE_COUNTER_LOCK:
+            _GENERATE_COUNTER += 1
+            gen_count = _GENERATE_COUNTER
+            
+            # Every 5 generations, do a light reset
+            # (Or if user explicitly requests it)
+            if gen_count % 5 == 0 or force_reset:
+                logging.info(f"[Generate {req_id}] Triggering light reset (generation #{gen_count})")
+                mrt = get_mrt()
+                _light_reset_mrt(mrt)
+
         # 0) Read file -> tmp wav
         data = loop_audio.file.read()
         if not data:
