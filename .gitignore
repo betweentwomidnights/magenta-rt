@@ -1,0 +1,34 @@
+# project-specific ignores
+patches/
+docs/
+notes.txt
+pyproject.toml
+
+# python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# environment variables
+.env
+.env.local
+
+# IDE/editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# docker volumes/logs (if running locally)
+*.log
+
+# temporary files
+tmp/
+temp/
+*.tmp

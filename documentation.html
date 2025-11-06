@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>MagentaRT Research API</title>
+  <title>magenta-rt backend</title>
   <style>
     body { 
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
@@ -11,8 +11,16 @@
       padding: 0 24px; 
       color: #111; 
       line-height: 1.6;
+      background: #fafafa;
     }
-    .header { text-align: center; margin-bottom: 48px; }
+    .header { 
+      text-align: center; 
+      margin-bottom: 48px;
+      background: white;
+      padding: 32px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
     .badge { 
       display: inline-block; 
       background: #ff6b35; 
@@ -23,39 +31,41 @@
       font-weight: 500;
       margin-left: 8px;
     }
-    code, pre { 
-      background: #f6f8fa; 
-      border: 1px solid #eaecef; 
-      border-radius: 6px; 
-      font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
+    .section {
+      background: white;
+      padding: 32px;
+      margin: 24px 0;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
     }
-    code { padding: 2px 6px; }
-    pre { 
-      padding: 16px; 
-      overflow-x: auto; 
-      margin: 16px 0;
-      position: relative;
-    }
-    .copy-btn {
-      position: absolute;
-      top: 8px;
-      right: 8px;
+    .btn {
+      display: inline-block;
       background: #0969da;
       color: white;
-      border: none;
-      border-radius: 4px;
-      padding: 4px 8px;
-      font-size: 12px;
-      cursor: pointer;
+      padding: 12px 24px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 500;
+      margin: 8px;
     }
-    .copy-btn:hover { background: #0550ae; }
-    .muted { color: #656d76; }
-    .warning { 
-      background: #fff8c5; 
-      border: 1px solid #e3b341; 
-      border-radius: 8px; 
-      padding: 16px; 
-      margin: 16px 0;
+    .btn:hover {
+      background: #0550ae;
+    }
+    .btn-secondary {
+      background: #656d76;
+    }
+    .btn-secondary:hover {
+      background: #424a53;
+    }
+    .demo-video {
+      text-align: center;
+      margin: 32px 0;
+    }
+    .demo-video video {
+      width: 100%;
+      max-width: 540px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
     .info { 
       background: #dbeafe; 
@@ -64,358 +74,142 @@
       padding: 16px; 
       margin: 16px 0;
     }
-    ul { line-height: 1.8; }
-    .endpoint { 
-      background: #f8f9fa; 
-      border-left: 4px solid #0969da; 
-      padding: 12px 16px; 
-      margin: 12px 0;
-    }
-    .demo-placeholder {
-      background: #f6f8fa;
-      border: 2px dashed #d1d9e0;
-      border-radius: 8px;
-      padding: 48px;
-      text-align: center;
-      margin: 24px 0;
-      color: #656d76;
-    }
-    .grid { 
-      display: grid; 
-      grid-template-columns: 1fr 1fr; 
-      gap: 24px; 
-      margin: 24px 0;
-    }
-    .card {
-      background: #f8f9fa;
-      border: 1px solid #e1e8ed;
-      border-radius: 8px;
-      padding: 20px;
-    }
     a { color: #0969da; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .section { margin: 48px 0; }
+    .muted { color: #656d76; font-size: 0.9em; }
+    ul { line-height: 1.8; }
+    code {
+      background: #f6f8fa;
+      border: 1px solid #eaecef;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 0.9em;
+    }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>magentaRT research API</h1>
-    <p class="muted"><strong>exploring ways to jam</strong> • real-time streaming with http/ws • custom fine-tune model-switching support</p>
-    <span class="badge">research project</span>
+    <h1>magenta-rt backend</h1>
+    <p class="muted">
+      <strong>local backend for gary4juce</strong><br>
+      also includes real-time streaming and continuous jamming endpoints
+    </p>
+    <span class="badge">running locally</span>
   </div>
 
   <div class="section">
-    <h2>what this is</h2>
-    <p>this API serves google's <a href="https://huggingface.co/google/magenta-realtime" target="_blank">magentaRT</a> in two distinct ways. first, as a backend for our iOS app (the untitled jamming app) where users create initial loops with stability ai's <a href="https://huggingface.co/stabilityai/stable-audio-open-small" target="_blank">stable-audio-open-small</a> and then MagentaRT uses the combined audio as context. second, as a standalone web interface that connects directly to magentaRT via websockets without any audio context.</p>
-    
-    <p>both modes support switching between base models and custom fine-tunes hosted on Hugging Face. this is designed as a template space for duplication, letting you experiment with real-time music generation outside of google colab.</p>
-    
-    <p>this is meant to be duplicated to your own GPU-enabled space since the iOS app is still in active development and doesn't have funding to support multiple concurrent users yet.</p>
+    <h2>what you're looking at</h2>
+    <p>
+      this is a docker container running google's <a href="https://github.com/magenta/magenta-realtime" target="_blank">magenta-realtime</a> model. 
+      primarily designed as the "darius" backend for <a href="https://thepatch.gumroad.com/l/gary4juce" target="_blank">gary4juce</a>, 
+      but includes additional endpoints for real-time streaming and continuous generation.
+    </p>
     
     <div class="info">
-      <strong>hardware requirements:</strong> optimal performance requires an L40S GPU (48GB VRAM) for real-time streaming. L4 24GB almost works but will not achieve real-time performance (if someone knows an optimization that will solve this, please let me know).
-    </div>
-  </div>
-
-  <section id="env-vars" style="margin-top: 24px;">
-  <h3>environment variables (optional, but helpful)</h3>
-  <p>
-    you can boot this Space directly into your own finetune by setting the variables below in
-    <em>Settings → Variables and secrets → Variables</em>. if you don't set them, you can still
-    select models at runtime using <code>/model/select</code> from the frontend/API.
-  </p>
-
-  <div class="callout" style="padding:12px;border:1px solid #e0e0e0;border-radius:8px;background:#fafafa;margin:16px 0;">
-    <strong>Quick start:</strong> set these to make a finetune the default on boot:
-    <ul style="margin:8px 0 0 18px;">
-      <li><code>MRT_CKPT_REPO</code> → <code>thepatch/magenta-ft</code></li>
-      <li><code>MRT_CKPT_STEP</code> → <code>1863001</code></li>
-      <li><code>MRT_SIZE</code> → <code>large</code></li>
-    </ul>
-    <p style="margin:8px 0 0 0;"><small>those values correspond to the example finetune in this repo (checkpoint_1863001.tgz on top of the <em>large</em> base).</small></p>
-  </div>
-
-  <table class="var-table" style="width:100%;border-collapse:collapse;margin:12px 0;">
-    <thead>
-      <tr>
-        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">name</th>
-        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">what it does</th>
-        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">example</th>
-        <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">when to set</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_CKPT_REPO</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">huggingface repo ID that hosts your finetune checkpoints/assets.</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>thepatch/magenta-ft</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">set to make this finetune the default on boot.</td>
-      </tr>
-      <tr>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_CKPT_STEP</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">checkpoint step number to load on boot.</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>1863001</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">set if you want a specific checkpoint preselected.</td>
-      </tr>
-      <tr>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>MRT_SIZE</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">base model family used by the finetune (e.g., <em>large</em>).</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>large</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">set to match the base you finetuned from.</td>
-      </tr>
-      <tr>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>SPACE_MODE</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">controls readiness behavior: <code>serve</code> (GPU, ready to generate) vs <code>template</code> (CPU template for duplication). If unset, the server auto-detects.</td>
-        <td style="padding:8px;border-bottom:1px solid #eee;"><code>serve</code> or <code>template</code></td>
-        <td style="padding:8px;border-bottom:1px solid #eee;">set for explicit behavior; otherwise it falls back to auto-detection.</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <details style="margin-top:12px;">
-    <summary><strong>alternative: select a model at runtime via API</strong></summary>
-    <pre style="background:#111;color:#eee;padding:12px;border-radius:8px;overflow:auto;margin-top:8px;"><code style="background: transparent; color: inherit; padding: 0; border: 0; box-shadow: none; display: block;">curl -X POST https://&lt;your-space&gt;.hf.space/model/select \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "ckpt_repo": "thepatch/magenta-ft",
-    "ckpt_step": 1863001,
-    "size": "large",
-    "prewarm": true
-  }'</code></pre>
-    <p style="margin:8px 0 0 0;"><small>when you call <code>prewarm:true</code>, the backend performs a warmup before returning, so the first jam starts hot.</small></p>
-  </details>
-</section>
-
-<p style="text-align:center; margin-top:12px;">
-  <a class="btn" href="/tester" target="_blank" style="
-     display:inline-block; padding:10px 14px; border-radius:8px;
-     background:#111; color:#eee; text-decoration:none; border:1px solid #444;">
-    open realtime web tester
-  </a>
-</p>
-
-  <div class="demo-placeholder">
-  <h3>app demo video</h3>
-  <video controls preload="metadata" playsinline style="width:100%; border-radius:8px; max-width:540px; display:block; margin:0 auto">
-    <source src="./lil_demo_540p.mp4" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
-  <p class="muted"><small>iPhone app generating music in real-time</small></p>
-</div>
-
-  <div class="section">
-    <h2>overview</h2>
-    <p>this API revolves around google's magentaRT, designed for real-time audio streaming using finetunes hosted on HF. built for iOS app integration with webSocket streaming support for web applications (and potentially VST plugins).</p>
-  </div>
-
-  <div class="section">
-    <h2>quick start - webSocket streaming</h2>
-    <p>connect to <code>wss://&lt;your-space&gt;/ws/jam</code> for real-time audio generation:</p>
-
-    <h3>start real-time generation</h3>
-    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
-  "type": "start",
-  "mode": "rt",
-  "binary_audio": false,
-  "params": {
-    "styles": "electronic, ambient",
-    "style_weights": "1.0, 0.8",
-    "temperature": 1.1,
-    "topk": 40,
-    "guidance_weight": 1.1,
-    "pace": "realtime",
-    "style_ramp_seconds": 8.0,
-    "mean": 0.0,
-    "centroid_weights": "0.0, 0.0, 0.0"
-  }
-}</pre>
-
-    <h3>update parameters live</h3>
-    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{
-  "type": "update",
-  "styles": "jazz, hiphop",
-  "style_weights": "1.0, 0.8",
-  "temperature": 1.2,
-  "topk": 64,
-  "guidance_weight": 1.0,
-  "mean": 0.2,
-  "centroid_weights": "0.1, 0.3, 0.0"
-}</pre>
-
-    <h3>stop generation</h3>
-    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button>{"type": "stop"}</pre>
-  </div>
-
-  <div class="section">
-    <h2>API endpoints</h2>
-    
-    <div class="endpoint">
-      <strong>POST /generate</strong> - generate 4–8 bars of music with input audio
-    </div>
-    
-    <div class="endpoint">
-      <strong>POST /generate_style</strong> - generate music from style prompts only (experimental)
-    </div>
-    
-    <div class="endpoint">
-      <strong>POST /jam/start</strong> - start continuous jamming session
-    </div>
-    
-    <div class="endpoint">
-      <strong>GET /jam/next</strong> - get next audio chunk from session
-    </div>
-    
-    <div class="endpoint">
-      <strong>POST /jam/consume</strong> - mark chunk as consumed
-    </div>
-    
-    <div class="endpoint">
-      <strong>POST /jam/stop</strong> - end jamming session
-    </div>
-    
-    <div class="endpoint">
-      <strong>WEBSOCKET /ws/jam</strong> - real-time streaming interface
-    </div>
-    
-    <div class="endpoint">
-      <strong>POST /model/select</strong> - switch between base and fine-tuned models
+      <strong>backend URL:</strong> <code>http://localhost:7860</code><br>
+      enter this in gary4juce's darius settings to start generating music continuations from your DAW.
     </div>
   </div>
 
   <div class="section">
-    <h2>custom fine-tuning</h2>
-    <p>train your own MagentaRT models and use them in the web app demo or the iOS app.</p>
+    <h2>try the web tester</h2>
+    <p>
+      experiment with real-time music generation in your browser. this interface lets you generate music on the fly, 
+      adjust parameters live, and switch between different models and checkpoints.
+    </p>
+    <p style="text-align: center; margin-top: 24px;">
+      <a class="btn" href="/tester" target="_blank">open real-time web tester</a>
+    </p>
+  </div>
 
-    <div class="grid">
-      <div class="card">
-        <h3>1. train your model</h3>
-        <p>use the official MagentaRT fine-tuning notebook:</p>
-        <p><a href="https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Finetune.ipynb" target="_blank">MagentaRT Fine-tuning Colab</a></p>
-        <p>this will create checkpoint folders like:</p>
-        <ul>
-          <li><code>checkpoint_1861001/</code></li>
-          <li><code>checkpoint_1862001/</code></li>
-          <li>and steering assets: <code>cluster_centroids.npy</code>, <code>mean_style_embed.npy</code></li>
-        </ul>
-      </div>
+  <div class="demo-video">
+    <h3>untitled jamming app demo</h3>
+    <video controls preload="metadata" playsinline>
+      <source src="./lil_demo_540p.mp4" type="video/mp4">
+      your browser does not support the video tag.
+    </video>
+    <p class="muted">the <code>/jam/*</code> endpoints power this iOS app (currently in TestFlight)</p>
+  </div>
 
-      <div class="card">
-        <h3>2. package checkpoints</h3>
-        <p>checkpoints must be compressed as .tgz files to preserve .zarray files correctly.</p>
-        <div class="warning">
-          <strong>important:</strong> do not download checkpoint folders directly from Google Drive - the .zarray files won't transfer properly.
-        </div>
-      </div>
-    </div>
-
-    <h3>checkpoint packaging script</h3>
-    <p>use this in a Colab cell to properly package your checkpoints:</p>
-    <pre><button class="copy-btn" onclick="copyCode(this)">Copy</button># Mount Drive to access your trained checkpoints
-from google.colab import drive
-drive.mount('/content/drive')
-
-# Set the path to your checkpoint folder
-CKPT_SRC = '/content/drive/MyDrive/thepatch/checkpoint_1862001'  # Adjust path
-
-# Copy folder to local storage (preserves dotfiles)
-!rm -rf /content/checkpoint_1862001
-!cp -a "$CKPT_SRC" /content/
-
-# Verify .zarray files are present
-!find /content/checkpoint_1862001 -name .zarray | wc -l
-
-# Create properly formatted .tgz archive
-!tar -C /content -czf /content/checkpoint_1862001.tgz checkpoint_1862001
-
-# Verify critical files are in the archive
-!tar -tzf /content/checkpoint_1862001.tgz | grep -c '.zarray'
-
-# Download the .tgz file
-from google.colab import files
-files.download('/content/checkpoint_1862001.tgz')</pre>
-
-    <h3>3. upload to hugging face</h3>
-    <p>create a model repository and upload:</p>
+  <div class="section">
+    <h2>available endpoints</h2>
+    
+    <h3>one-shot generation (gary4juce)</h3>
     <ul>
-      <li>Your <code>.tgz</code> checkpoint files</li>
-      <li><code>cluster_centroids.npy</code> (for steering)</li>
-      <li><code>mean_style_embed.npy</code> (for steering)</li>
+      <li><code>POST /generate</code> - generate 4/8/16 bars with input audio</li>
+      <li><code>POST /generate_style</code> - experimental style-only generation</li>
+      <li><code>GET /progress</code> - poll generation progress</li>
     </ul>
-    
-    <div class="info">
-      <strong>example repository:</strong> <a href="https://huggingface.co/thepatch/magenta-ft" target="_blank">thepatch/magenta-ft</a><br>
-      shows the correct file structure with .tgz files and .npy steering assets in the root directory.
-    </div>
 
-    <h3>4. use in the app</h3>
-    <p>in the iOS app's model selector, point to your hf repository URL. the app will automatically discover available checkpoints and allow switching between them.</p>
-  </div>
-
-  <div class="section">
-    <h2>technical specifications</h2>
+    <h3>continuous jamming (iOS/mobile apps)</h3>
     <ul>
-      <li><strong>audio format:</strong> 48 kHz stereo, ~2.0s chunks with ~40ms crossfade. the 4/8 bar chunks will have varying length due to input bpm</li>
-      <li><strong>model sizes:</strong> 'base' and 'large' variants available (we didn't notice any speedup in generation time using 'base' rather than 'large')</li>
-      <li><strong>steering:</strong> support for text prompts, audio embeddings, and centroid-based fine-tune steering</li>
-      <li><strong>real-time performance:</strong> L40S recommended; L4 will experience slight delays</li>
-      <li><strong>Memory Requirements:</strong> 30+GB VRAM for sustained real-time streaming</li>
+      <li><code>POST /jam/start</code> - start continuous generation session</li>
+      <li><code>GET /jam/next</code> - get next audio chunk</li>
+      <li><code>POST /jam/consume</code> - mark chunk as consumed</li>
+      <li><code>POST /jam/update</code> - update parameters mid-session</li>
+      <li><code>POST /jam/stop</code> - end session</li>
     </ul>
 
-
-
-  <div class="section">
-    <h2>a little more about the ios app</h2>
-    <p>uses http requests</p>
+    <h3>websocket streaming (web tester)</h3>
     <ul>
-      <li>the reseed endpoints are still under development... the idea is to re-inject the initial context with token splicing</li>
-      <li>single-shot generation endpoints (one_shot_generation.py)</li>
-      <li>the stable-audio-open-small backend is hosted by me. it generates with just 2gb GPU RAM</li>
-      <li>gradual style embed changes to try and avoid abrupt genre switches</li>
+      <li><code>WS /ws/jam</code> - real-time streaming interface</li>
+    </ul>
+
+    <h3>model management</h3>
+    <ul>
+      <li><code>POST /model/select</code> - switch between models and finetunes</li>
+      <li><code>GET /model/status</code> - check current configuration</li>
+      <li><code>GET /model/checkpoints</code> - list available checkpoints</li>
+    </ul>
+
+    <h3>utilities</h3>
+    <ul>
+      <li><code>GET /health</code> - check system status</li>
+      <li><code>GET /docs</code> - auto-generated API docs</li>
+      <li><code>GET /ping</code> - simple connectivity test</li>
     </ul>
   </div>
 
-      <div class="warning">
-      <strong>note:</strong> the <code>/generate_style</code> endpoint is experimental and may not properly adhere to BPM without additional context (considering metronome-based context instead of silence).
-    </div>
+  <div class="section">
+    <h2>using custom finetunes</h2>
+    <p>
+      you can train your own magenta-rt models and load them through the <code>/model/select</code> endpoint. 
+      for detailed instructions on training, packaging, and uploading finetunes, see the 
+      <a href="https://github.com/betweentwomidnights/magenta-rt-backend" target="_blank">github repo README</a>.
+    </p>
+    <p>
+      example finetune repo: <a href="https://huggingface.co/thepatch/magenta-ft" target="_blank">thepatch/magenta-ft</a>
+    </p>
   </div>
 
   <div class="section">
-    <h2>deployment</h2>
-    <p>to run your own instance:</p>
-    <ol>
-      <li>duplicate this huggingface space by clicking the three dots in the top right</li>
-      <li>select 'run locally' if you got a 5090 or something, otherwise just duplicate.</li>
-      <li>ensure you have access to an L40S GPU by enabling billing</li>
-      <li>point your iOS app to the new space URL (e.g., <code>https://your-username-magenta-retry.hf.space</code>)</li>
-      <li>upload your fine-tuned models to hf as described above </li>
-    </ol>
+    <h2>quick links</h2>
+    <p style="text-align: center;">
+      <a class="btn" href="/tester" target="_blank">web tester</a>
+      <a class="btn btn-secondary" href="/docs" target="_blank">api docs</a>
+      <a class="btn btn-secondary" href="https://github.com/betweentwomidnights/magenta-rt-backend" target="_blank">github repo</a>
+      <a class="btn btn-secondary" href="https://thepatch.gumroad.com/l/gary4juce" target="_blank">get gary4juce</a>
+    </p>
   </div>
 
   <div class="section">
-    <h2>support & contact</h2>
-    <p>this is an active research project. for questions, technical support, or collaboration:</p>
-    <p><strong>email:</strong> <a href="mailto:kev@thecollabagepatch.com">kev@thecollabagepatch.com</a></p>
-    
-    <div class="info">
-      <strong>research Status:</strong> this project is under very active development. features and API may change. We welcome feedback and contributions from the research community. im just a vibe coder.
-    </div>
+    <h2>support & community</h2>
+    <p>
+      having trouble or want to connect with other users?
+    </p>
+    <ul>
+      <li>email: <a href="mailto:kev@thecollabagepatch.com">kev@thecollabagepatch.com</a></li>
+      <li>discord: <a href="https://discord.gg/T8HVqwQw6T" target="_blank">https://discord.gg/T8HVqwQw6T</a></li>
+      <li>github: <a href="https://github.com/betweentwomidnights/magenta-rt-backend" target="_blank">report issues</a></li>
+    </ul>
   </div>
 
-  <div class="section">
-    <h2>licensing</h2>
-    <p>built on google's magentaRT (Apache 2.0 + CC-BY 4.0). users are responsible for their generated outputs and ensuring compliance with applicable laws and platform policies.</p>
-    <p><a href="/docs">auto-generated API docs (for all the http requests)</a></p>
+  <div class="section" style="text-align: center; background: #f6f8fa;">
+    <p class="muted">
+      built on google's <a href="https://github.com/magenta/magenta-realtime" target="_blank">magenta-realtime</a> (Apache 2.0 + CC-BY 4.0)<br>
+      developed by <a href="https://thecollabagepatch.com" target="_blank">collabagepatch</a>
+    </p>
   </div>
-
-  <script>
-    function copyCode(button) {
-      const pre = button.parentElement;
-      const code = pre.textContent.replace('Copy', '').trim();
-      navigator.clipboard.writeText(code).then(() => {
-        button.textContent = 'Copied!';
-        setTimeout(() => button.textContent = 'Copy', 2000);
-      });
-    }
-  </script>
 </body>
 </html>

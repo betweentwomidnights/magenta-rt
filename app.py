@@ -264,19 +264,7 @@ try:
 except Exception:
     _HAS_LOUDNORM = False
 
-# def _combine_styles(mrt, styles_str: str = "", weights_str: str = ""):
-#     extra = [s.strip() for s in (styles_str or "").split(",") if s.strip()]
-#     if not extra:
-#         return mrt.embed_style("warmup")
-#     sw = [float(x) for x in (weights_str or "").split(",") if x.strip()]
-#     embeds, weights = [], []
-#     for i, s in enumerate(extra):
-#         embeds.append(mrt.embed_style(s))
-#         weights.append(sw[i] if i < len(sw) else 1.0)
-#     wsum = sum(weights) or 1.0
-#     weights = [w/wsum for w in weights]
-#     import numpy as np
-#     return np.sum([w*e for w, e in zip(weights, embeds)], axis=0).astype(np.float32)
+
 
 def build_style_vector(
     mrt,
@@ -465,7 +453,7 @@ def get_mrt():
                 ckpt_dir = CheckpointManager.resolve_checkpoint_dir()  # uses MRT_CKPT_REPO/STEP if present
                 _MRT = system.MagentaRT(
                     tag=os.getenv("MRT_SIZE", "large"),
-                    guidance_weight=5.0,
+                    guidance_weight=1.0,
                     device="gpu",
                     checkpoint_dir=ckpt_dir,
                     lazy=False
