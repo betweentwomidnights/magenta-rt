@@ -1,0 +1,163 @@
+# Dockerfile for Magenta RT Finetuning on x86_64 / Consumer GPUs (L40S, RTX 4090, etc.)
+# Based on thecollabagepatch/magenta:latest x86 inference container
+
+FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
+
+# Ensure CUDA libraries are on loader path
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-libraries-12-4 && rm -rf /var/lib/apt/lists/*
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda-12.4/lib64:/usr/local/cuda-12.4/compat:/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
+RUN ln -sf /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda/lib64 || true
+
+# Install cuDNN 9.8 for better compatibility
+RUN set -eux; \
+  apt-get update && apt-get install -y --no-install-recommends gnupg ca-certificates curl; \
+  install -d -m 0755 /usr/share/keyrings; \
+  curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub \
+    | gpg --batch --yes --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg; \
+  apt-get update; \
+  apt-mark unhold libcudnn9-cuda-12 || true; \
+  apt-get install -y --no-install-recommends \
+      'libcudnn9-cuda-12=9.8.*' \
+      'libcudnn9-dev-cuda-12=9.8.*' \
+      --allow-downgrades --allow-change-held-packages; \
+  apt-mark hold libcudnn9-cuda-12 || true; \
+  ldconfig; \
+  rm -rf /var/lib/apt/lists/*
+
+# Performance optimizations for L40S/Ada/consumer GPUs
+ENV LD_PRELOAD=/usr/local/cuda/lib64/libcusparse.so.12:/usr/local/cuda/lib64/libcublas.so.12:/usr/local/cuda/lib64/libcublasLt.so.12:/usr/local/cuda/lib64/libcufft.so.11:/usr/local/cuda/lib64/libcusolver.so.11
+ENV TF_GPU_ALLOCATOR=cuda_malloc_async
+ENV TF_ENABLE_CUBLAS_TF32=1 NVIDIA_TF32_OVERRIDE=1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TF_FORCE_GPU_ALLOW_GROWTH=true \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    JAX_PLATFORMS=""
+
+SHELL ["/bin/bash", "-c"]
+WORKDIR /magenta-realtime
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common curl ca-certificates \
+    build-essential pkg-config git \
+    libsndfile1 ffmpeg \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 default and install uv
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
+    python -m pip install --upgrade pip && \
+    python -m pip install uv
+
+# CRITICAL FOR x86_64: Install TensorFlow FIRST to block tensorflow-cpu
+RUN uv pip install --system tf-nightly
+
+# Install JAX with CUDA support
+RUN uv pip install --system "jax[cuda12]" jaxlib
+
+# Install base dependencies
+RUN uv pip install --system \
+    absl-py chex gin-config numpy requests tqdm typing-extensions \
+    google-cloud-storage librosa resampy soundfile sentencepiece
+
+# Clone and install t5x WITHOUT its dependencies (to avoid tensorflow-cpu)
+RUN git clone https://github.com/google-research/t5x.git /t5x && \
+    cd /t5x && \
+    git checkout 92c5b467a5964d06c351c7eae4aa4bcd341c7ded && \
+    uv pip install --system --no-deps -e .
+
+# Install flaxformer without deps
+RUN git clone https://github.com/google/flaxformer.git /flaxformer && \
+    cd /flaxformer && \
+    git checkout 399ea3a && \
+    uv pip install --system --no-deps -e .
+
+# Install seqio without deps  
+RUN git clone https://github.com/google/seqio.git /seqio && \
+    cd /seqio && \
+    uv pip install --system --no-deps -e . && \
+    # CRITICAL: Remove unused tensorflow_text import (not needed by Magenta RT)
+    sed -i '/import tensorflow_text as tf_text/d' /seqio/seqio/vocabularies.py
+
+# Install airio (t5x dependency) without deps
+RUN git clone https://github.com/google/airio.git /airio && \
+    cd /airio && \
+    uv pip install --system --no-deps -e .
+
+# Install clu without deps
+RUN git clone https://github.com/google/CommonLoopUtils.git /clu && \
+    cd /clu && \
+    uv pip install --system --no-deps -e .
+
+# Install remaining dependencies for t5x/seqio/clu
+RUN uv pip install --system \
+    flax optax orbax-checkpoint \
+    fiddle cached_property tf2jax \
+    aqtp etils jestimator \
+    tensorflow-datasets tfds-nightly \
+    apache-beam pyyaml rouge-score sacrebleu scipy \
+    grain-nightly editdistance pyglove
+
+# Patch jestimator for newer JAX - PartitionSpec moved to jax.sharding
+RUN sed -i 's|from jax.experimental.pjit import PartitionSpec|from jax.sharding import PartitionSpec|g' \
+    /usr/local/lib/python3.11/dist-packages/jestimator/amos_helper.py || \
+    sed -i 's|from jax.experimental.pjit import PartitionSpec|from jax.sharding import PartitionSpec|g' \
+    /usr/lib/python3.11/dist-packages/jestimator/amos_helper.py || true
+
+# Patch t5x partitioning.py for newer JAX - core_on_chip attribute doesn't exist
+RUN python3 << 'EOF'
+import re
+
+with open('/t5x/t5x/partitioning.py', 'r') as f:
+    lines = f.readlines()
+
+# Find the line with core_on_chip and get its indentation
+for i, line in enumerate(lines):
+    if 'last_device.core_on_chip' in line:
+        # Get the indentation (leading spaces)
+        indent = len(line) - len(line.lstrip())
+        spaces = ' ' * indent
+        
+        # Replace with two properly indented lines
+        lines[i] = f"{spaces}core_on_chip = getattr(last_device, \"core_on_chip\", 0)\n"
+        lines.insert(i + 1, f"{spaces}return x + 1, y + 1, z + 1, core_on_chip + 1\n")
+        break
+
+with open('/t5x/t5x/partitioning.py', 'w') as f:
+    f.writelines(lines)
+EOF
+
+# Install magenta-realtime without deps
+RUN git clone https://github.com/magenta/magenta-realtime.git /magenta-realtime-src && \
+    cd /magenta-realtime-src && \
+    uv pip install --system --no-deps -e .
+
+# TRAINING-SPECIFIC: Install additional dependencies for finetuning
+RUN uv pip install --system \
+    scikit-learn matplotlib ipywidgets pyloudnorm soxr huggingface_hub
+
+# Ensure compatible protobuf version (TensorFlow 2.18+ needs protobuf 5.27+)
+RUN uv pip install --system --force-reinstall "protobuf>=5.27.0"
+
+# Set working directory and create cache
+WORKDIR /workspace
+ENV MAGENTA_RT_CACHE_DIR=/root/.cache/magenta_rt
+RUN mkdir -p $MAGENTA_RT_CACHE_DIR
+
+# Copy training scripts
+COPY prepare_data.py /workspace/
+COPY train.py /workspace/
+COPY FINETUNE_README.md /workspace/README.md
+
+# Create mount points for data
+RUN mkdir -p /data /outputs
+
+# Default command shows usage
+CMD ["bash", "-c", "cat /workspace/README.md && echo '\n\n=== Quick Start ===' && echo 'docker run --gpus all -v /path/to/audio:/data -v /path/to/output:/outputs <image> python prepare_data.py --audio_dir /data --output_dir /outputs'"]
