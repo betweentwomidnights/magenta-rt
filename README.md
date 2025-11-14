@@ -33,7 +33,7 @@ this is the "darius" backend for gary4juce - a JUCE VST/AU plugin that generates
 ### 1. clone the repo
 ```bash
 git clone https://github.com/betweentwomidnights/magenta-rt.git
-cd magenta-rt-backend
+cd magenta-rt
 ```
 
 ### 2. build the image
