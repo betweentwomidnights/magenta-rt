@@ -87,9 +87,11 @@ you can train your own magenta-rt models and use them through this backend.
 
 ### training workflow
 
-there are two ways to train custom models:
+we provide two methods for training: **Google Colab** (easiest) and **Docker-based training** (for those with powerful GPUs).
 
-#### option 1: google colab (easiest)
+---
+
+#### method 1: google colab (recommended for most users)
 
 1. **train your model** using the official magenta-rt colab:
    - [MagentaRT Fine-tuning Notebook](https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Finetune.ipynb)
@@ -130,94 +132,69 @@ from google.colab import files
 files.download('/content/checkpoint_1862001.tgz')
 ```
 
-#### option 2: docker-based training (advanced)
+---
 
-if you have access to high-VRAM GPUs locally, you can train using our docker images.
+#### method 2: docker-based training (for power users)
 
-**requirements:**
-- **GPU memory:** ~42GB VRAM observed during training on DGX Spark
-- **recommendation:** use [Runpod](https://runpod.io) if you don't have a 48GB+ GPU locally
-- consumer GPUs (RTX 4090, etc.) likely won't have enough VRAM for training
+if you have access to a GPU with **~42GB+ VRAM** (tested on DGX Spark), you can train locally using our Docker images.
 
-**status:**
-- `Dockerfile.finetune_arm64` - tested and proven on DGX Spark (ARM64 + Blackwell GB10)
-- `Dockerfile.finetune_x86` - untested, but based on our proven x86 inference container
+**GPU requirements for training:**
+- **observed usage:** ~41GB VRAM during training (DGX Spark)
+- **recommended:** rent a GPU on [RunPod](https://runpod.io) if you don't have adequate hardware
+- **note:** consumer GPUs (RTX 4090, etc) typically don't have enough VRAM for training
 
-**1. build the finetuning image:**
+**build the training image:**
 
 ```bash
-# for x86_64 systems (untested but should work)
+# for x86_64 GPUs (untested but based on proven inference setup)
 docker build -f Dockerfile.finetune_x86 -t magenta-finetune:latest .
 
-# for arm64 systems (tested on DGX Spark)
+# for arm64 GPUs (tested on DGX Spark with Blackwell GB10)
 docker build -f Dockerfile.finetune_arm64 -t magenta-finetune:latest .
 ```
 
-**2. prepare your dataset:**
+**step 1: prepare your dataset**
 
-organize your training audio files (mp3 or wav) in a directory:
-```bash
-~/my_dataset/
-  ├── track001.mp3
-  ├── track002.mp3
-  └── ...
-```
-
-**3. run data preparation:**
+organize your audio files (MP3 or WAV) in a folder, then run `prepare_data.py`:
 
 ```bash
 docker run --gpus all \
-  -v ~/my_dataset:/data:ro \
-  -v ~/magenta_finetune_outputs_mymodel:/outputs \
+  -v ~/my_audio_dataset:/data:ro \
+  -v ~/magenta_finetune_outputs:/outputs \
   magenta-finetune:latest \
   python prepare_data.py \
     --audio_dir /data \
     --output_dir /outputs \
-    --task_name mymodel
+    --task_name my_model
 ```
 
-this creates:
-- `mymodel_examples.recordio` - tokenized training data
-- `cluster_centroids.npy` - style steering assets
-- `mean_style_embed.npy` - style embedding statistics
+this will create:
+- `my_model_examples.recordio` - tokenized audio data
+- `cluster_centroids.npy` - for steering controls
+- `mean_style_embed.npy` - for steering controls
 
-**4. run training:**
-
-⚠️ **critical:** use the same `task_name` as prepare_data!
+**step 2: train the model**
 
 ```bash
 docker run --gpus all \
-  -v ~/magenta_finetune_outputs_mymodel:/outputs \
+  -v ~/magenta_finetune_outputs:/outputs \
   magenta-finetune:latest \
   python train.py \
-    --task_name mymodel \
+    --task_name my_model \
     --output_dir /outputs \
     --num_steps 6000
 ```
 
-training will create timestamped folders with checkpoints:
-```
-~/magenta_finetune_outputs_mymodel/
-  ├── 20251113_1743/
-  │   ├── checkpoint_1861001/
-  │   ├── checkpoint_1862001/
-  │   └── ...
-  ├── cluster_centroids.npy
-  ├── mean_style_embed.npy
-  └── mymodel_examples.recordio
-```
+⚠️ **critical:** the `task_name` must match between prepare_data and train steps!
 
-**5. package checkpoints for huggingface:**
+training will create timestamped folders containing checkpoints (e.g., `20251113_1743/checkpoint_1861001/`).
 
-if you want to use your model with the web tester or gary4juce, archive the checkpoints:
+**step 3: package checkpoints for huggingface**
 
 ```bash
-cd ~/magenta_finetune_outputs_mymodel/20251113_1743
+cd ~/magenta_finetune_outputs/20251113_1743
 
-# fix permissions if needed (docker runs as root)
-sudo chown -R $USER:$USER .
-
-# create .tgz archives
+# archive each checkpoint to .tgz (required for proper .zarray preservation)
 for ckpt in checkpoint_*; do
   echo "Archiving $ckpt..."
   tar -czf ${ckpt}.tgz $ckpt
@@ -226,14 +203,38 @@ for ckpt in checkpoint_*; do
 done
 ```
 
-### uploading to hugging face
+**step 4: fix permissions (docker runs as root)**
 
-create a model repository and upload:
-- your `.tgz` checkpoint files
-- `cluster_centroids.npy` (for steering)
-- `mean_style_embed.npy` (for steering)
+```bash
+sudo chown -R $USER:$USER ~/magenta_finetune_outputs
+```
+
+your output folder will contain:
+```
+magenta_finetune_outputs/
+├── 20251113_1743/
+│   ├── checkpoint_1861001.tgz
+│   ├── checkpoint_1862001.tgz
+│   └── ...
+├── cluster_centroids.npy
+├── mean_style_embed.npy
+└── my_model_examples.recordio
+```
+
+---
+
+### uploading to huggingface
+
+regardless of training method, upload these files to your HuggingFace model repo:
+
+**required files:**
+- `checkpoint_*.tgz` (one or more checkpoints)
+- `cluster_centroids.npy` (for steering controls)
+- `mean_style_embed.npy` (for steering controls)
 
 **example repo:** [thepatch/magenta-ft](https://huggingface.co/thepatch/magenta-ft)
+
+**⚠️ important:** do not upload raw checkpoint folders - always use `.tgz` archives to preserve `.zarray` files!
 
 ### using your finetune
 
@@ -323,9 +324,8 @@ the continuous jamming endpoints (`/jam/*`) power an iOS app currently in TestFl
 - L4 will experience slight delays but works fine for DAW workflows
 
 **memory requirements:**
-- 30+GB VRAM for sustained real-time streaming
-- 24GB minimum for standard generation (non-realtime)
-- ~42GB VRAM for training (recommend Runpod or cloud GPUs)
+- **inference:** 24GB minimum for standard generation, 30+GB for sustained real-time streaming
+- **training:** ~42GB VRAM observed (recommend 48GB+ for headroom)
 
 ## troubleshooting
 
@@ -355,7 +355,7 @@ docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
 
 having trouble? reach out:
 - email: kev@thecollabagepatch.com
-- discord: https://discord.gg/T8HVqwQw6T
+- discord: https://discord.gg/PKj2aaDhFe
 - github issues: (this repo)
 
 ## credits
