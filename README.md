@@ -32,7 +32,7 @@ this is the "darius" backend for gary4juce - a JUCE VST/AU plugin that generates
 
 ### 1. clone the repo
 ```bash
-git clone https://github.com/betweentwomidnights/magenta-rt-backend.git
+git clone https://github.com/betweentwomidnights/magenta-rt.git
 cd magenta-rt-backend
 ```
 
@@ -232,7 +232,7 @@ regardless of training method, upload these files to your HuggingFace model repo
 - `cluster_centroids.npy` (for steering controls)
 - `mean_style_embed.npy` (for steering controls)
 
-**example repo:** [thepatch/magenta-ft](https://huggingface.co/thepatch/magenta-ft)
+**example repo:** [thepatch/magenta-ks](https://huggingface.co/thepatch/magenta-ks)
 
 **⚠️ important:** do not upload raw checkpoint folders - always use `.tgz` archives to preserve `.zarray` files!
 
